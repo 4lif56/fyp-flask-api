@@ -4,6 +4,9 @@ from sklearn.ensemble import IsolationForest
 import io
 
 app = Flask(__name__)
+from flask_cors import CORS
+CORS(app)
+
 
 @app.route('/detect', methods=['POST'])
 def detect_anomalies():
