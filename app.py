@@ -9,38 +9,28 @@ CORS(app)
 
 
 @app.route('/detect', methods=['POST'])
-def detect_anomalies():
-    file = request.files.get('file')
-    print("📂 Received file:", file)
-
-
-    if not file:
-        return jsonify({"error": "No file uploaded"}), 400
-
-    # Read CSV file
+def detect():
     try:
-        df = pd.read_csv(io.StringIO(file.read().decode('utf-8')))
+        file = request.files['file']
+        df = pd.read_csv(file)
+
+        # Run Isolation Forest (your anomaly detection logic)
+        iso = IsolationForest(contamination=0.02, random_state=42)
+        df['anomaly_score'] = iso.fit_predict(df.select_dtypes(include=['float64', 'int64']))
+        df['anomaly_label'] = df['anomaly_score'].map({1: 'Normal', -1: 'Anomaly'})
+
+        summary = {
+            "total_rows": len(df),
+            "anomalies": int((df['anomaly_label'] == 'Anomaly').sum())
+        }
+
+        return jsonify({
+            "summary": summary,
+            "results": df.to_dict(orient="records")  # 🔥 full dataset (no .head(50))
+        })
+
     except Exception as e:
-        return jsonify({"error": f"Failed to read CSV: {str(e)}"}), 400
-
-    # Check numeric columns
-    numeric_cols = df.select_dtypes(include=['number']).columns
-    if len(numeric_cols) == 0:
-        return jsonify({"error": "No numeric columns found"}), 400
-
-    # Apply Isolation Forest
-    model = IsolationForest(contamination=0.02, random_state=42)
-    df["anomaly_label"] = model.fit_predict(df[numeric_cols])
-    df["anomaly_label"] = df["anomaly_label"].map({1: "Normal", -1: "Anomaly"})
-
-    # Count summary
-    total = len(df)
-    anomalies = len(df[df["anomaly_label"] == "Anomaly"])
-
-    return jsonify({
-        "summary": {"total_rows": total, "anomalies": anomalies},
-        "results": df.head(50).to_dict(orient="records")
-    })
+        return jsonify({"error": str(e)}), 400
 
 if __name__ == "__main__":
     app.run(debug=True)
