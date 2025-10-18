@@ -1,10 +1,10 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 import io
 
 app = Flask(__name__)
-from flask_cors import CORS
 CORS(app)
 
 
