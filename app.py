@@ -24,10 +24,13 @@ def detect():
             "anomalies": int((df['anomaly_label'] == 'Anomaly').sum())
         }
 
+        df = df.fillna("")  # Replace NaN with empty string before sending
+
         return jsonify({
             "summary": summary,
-            "results": df.to_dict(orient="records")  # 🔥 full dataset (no .head(50))
+            "results": df.to_dict(orient="records")
         })
+
 
     except Exception as e:
         return jsonify({"error": str(e)}), 400
