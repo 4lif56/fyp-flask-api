@@ -10,23 +10,35 @@ app = Flask(__name__)
 CORS(app)
 
 def preprocess_data(df):
+    """
+    Cleans and prepares ANY uploaded CSV file for anomaly detection.
+    Handles DD/MM/YYYY and other mixed date formats safely.
+    """
     # --- 1. Ensure timestamp exists ---
     if 'timestamp' not in df.columns:
         raise ValueError("CSV must contain a 'timestamp' column.")
     df = df.dropna(subset=['timestamp'])
 
-    # --- 2. Parse timestamp ---
-    df['timestamp_dt'] = pd.to_datetime(df['timestamp'], errors='coerce', dayfirst=True)
+    # --- 2. Parse timestamp robustly ---
+    df['timestamp_dt'] = pd.to_datetime(
+        df['timestamp'],
+        errors='coerce',  # invalid dates become NaT
+        dayfirst=True      # DD/MM/YYYY format
+    )
     df = df.dropna(subset=['timestamp_dt'])
 
     # --- 3. Signup date ---
     if 'signup_date' in df.columns:
-        df['signup_date_dt'] = pd.to_datetime(df['signup_date'], errors='coerce', dayfirst=True)
+        df['signup_date_dt'] = pd.to_datetime(
+            df['signup_date'],
+            errors='coerce',
+            dayfirst=True
+        )
         df['signup_date_dt'] = df['signup_date_dt'].fillna(df['timestamp_dt'])
     else:
         df['signup_date_dt'] = df['timestamp_dt']
 
-    # --- 4. Feature Engineering ---
+    # --- 4. Feature engineering ---
     df['account_age_days'] = (df['timestamp_dt'] - df['signup_date_dt']).dt.days
     df['day_of_week'] = df['timestamp_dt'].dt.dayofweek
     df['is_weekend'] = df['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
@@ -48,7 +60,7 @@ def preprocess_data(df):
     ]
     for col in numeric_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         else:
             df[col] = 0
 
