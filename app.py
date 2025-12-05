@@ -9,7 +9,6 @@ app = Flask(__name__)
 CORS(app)
 
 # --- FIX 1: DISABLE ALPHABETICAL SORTING ---
-# This ensures the JSON stays in the exact order we define (User ID first)
 app.json.sort_keys = False 
 
 def smart_rename(df):
@@ -156,35 +155,79 @@ def detect():
             if col in df_export.columns:
                 df_export[col] = df_export[col].astype(int).map(mapping_dict).fillna(df_export[col])
 
-        # 2. Format Timestamp
+        # 2. BEAUTIFY "DAY OF WEEK" & "WEEKEND" (New Feature!)
+        day_mapping = {0: 'Mon', 1: 'Tue', 2: 'Wed', 3: 'Thu', 4: 'Fri', 5: 'Sat', 6: 'Sun'}
+        weekend_mapping = {0: 'No', 1: 'Yes'}
+        
+        if 'day_of_week' in df_export.columns:
+            df_export['day_of_week'] = df_export['day_of_week'].map(day_mapping)
+        
+        if 'is_weekend' in df_export.columns:
+            df_export['is_weekend'] = df_export['is_weekend'].map(weekend_mapping)
+
+        # 3. Format Timestamp
         df_export['timestamp'] = df_export['timestamp_dt'].astype(str)
 
-        # 3. FIX: Drop helper columns so they don't show in UI
+        # 4. Remove Helper Columns
         cols_to_drop = ['timestamp_dt', 'signup_date_dt']
         df_export = df_export.drop(columns=[c for c in cols_to_drop if c in df_export.columns])
 
-        # 4. Smart Column Reordering
-        priority_id_cols = ['user_id', 'client_id', 'id', 'username', 'user']
-        display_id_col = 'user_id'
-        for col in df_export.columns:
-            if col.lower() in priority_id_cols:
-                display_id_col = col
-                break
+        # 5. RENAME COLUMNS TO BE HUMAN-READABLE (Professional Polish)
+        pretty_names = {
+            'user_id': 'User ID',
+            'anomaly_label': 'Status',
+            'anomaly_score': 'Risk Score',  # "Risk Score" sounds more professional than just "Score"
+            'timestamp': 'Time',
+            'country': 'Country',
+            'operation': 'Action',
+            'file_type': 'File Type',       # Removed underscore
+            'file_size': 'Size',
+            'subscription_type': 'Plan',    # "Plan" is cleaner than "Subscription Type"
+            'account_age_days': 'Account Age',
+            'is_weekend': 'Weekend',
+            'day_of_week': 'Day',
+            'storage_limit': 'Limit',
+            'success': 'Success',
+            'hour': 'Hour of Day'
+        }
+        df_export = df_export.rename(columns=pretty_names)
 
-        # Define STRICT order: ID -> Result -> Time -> Details
-        cols_priority = [display_id_col, 'anomaly_label', 'anomaly_score', 'timestamp', 'country', 'operation', 'file_type', 'subscription_type']
-        cols_rest = [c for c in df_export.columns if c not in cols_priority]
-        final_order = [c for c in (cols_priority + cols_rest) if c in df_export.columns]
+        # 6. Smart Column Reordering (Using New Names)
+        # We need to look for the NEW names now
+        display_id_col = 'User ID' 
+        if display_id_col not in df_export.columns:
+             for col in df_export.columns:
+                 if 'User' in col or 'ID' in col: # Check for capitalized versions now
+                     display_id_col = col
+                     break
+        
+        # Define STRICT order using the PROFESSIONAL Names
+        desired_order = [
+            display_id_col,   # User ID
+            'Status', 
+            'Risk Score', 
+            'Time', 
+            'Country', 
+            'Action', 
+            'File Type', 
+            'Plan', 
+            'Size', 
+            'Limit',
+            'Weekend',
+            'Day',
+            'Account Age'
+        ]
+        
+        existing_cols = df_export.columns.tolist()
+        final_order = [c for c in desired_order if c in existing_cols] + [c for c in existing_cols if c not in desired_order]
         df_export = df_export[final_order]
 
-       # 5. Final Clean
+        # 7. Final Clean
         df_export = df_export.replace([np.inf, -np.inf], "").fillna("")
 
-        # --- NEW SORTING LOGIC ---
-        # Sort by User ID so 1 comes before 10, 10 before 71, etc.
+        # 8. Sort by User ID (Ascending)
         if display_id_col in df_export.columns:
-            df_export = df_export.sort_values(by=display_id_col, ascending=True)
-        # -------------------------
+             df_export = df_export.sort_values(by=display_id_col, ascending=True)
 
         return jsonify({
             "summary": summary,
