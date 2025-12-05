@@ -8,6 +8,10 @@ import numpy as np
 app = Flask(__name__)
 CORS(app)
 
+# --- FIX 1: DISABLE ALPHABETICAL SORTING ---
+# This ensures the JSON stays in the exact order we define (User ID first)
+app.json.sort_keys = False 
+
 def smart_rename(df):
     """
     Scans columns and renames them to standard names if they match common keywords.
@@ -40,9 +44,8 @@ def smart_rename(df):
 
 def preprocess_data(df):
     """
-    Cleans and prepares the uploaded CSV file with maximum flexibility.
+    Cleans and prepares the uploaded CSV file.
     """
-    
     # 1. SMART RENAMING
     df = smart_rename(df)
 
@@ -76,9 +79,6 @@ def preprocess_data(df):
         df['success'] = 1 
 
     # 7. HANDLE NUMERIC COLUMNS
-    # Note: Categorical columns (country, file_type, etc.) are treated as numeric here 
-    # because Isolation Forest needs numbers. We assume the user uploads 'cleaned' data (numbers)
-    # or we force it. If it's text, it becomes NaN -> 0.
     numeric_features = [
         'file_size', 'storage_limit', 'subscription_type',
         'country', 'operation', 'user_id', 'file_type', 'hour'
@@ -86,7 +86,7 @@ def preprocess_data(df):
 
     for col in numeric_features:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         else:
             df[col] = 0 
 
@@ -112,7 +112,6 @@ def detect():
             return jsonify({"error": "No file selected"}), 400
             
         try:
-            # utf-8-sig handles BOM
             df_original = pd.read_csv(file, encoding='utf-8-sig') 
         except Exception as e:
             return jsonify({"error": f"Could not read CSV file: {str(e)}"}), 400
@@ -146,7 +145,6 @@ def detect():
         df_export = df.copy()
         
         # 1. TRANSLATE CODES BACK TO NAMES
-        # Define all mappings
         mappings = {
             'country': {0: 'DE', 1: 'FR', 2: 'GB', 3: 'PL', 4: 'UA', 5: 'US'},
             'operation': {0: 'delete', 1: 'download', 2: 'modify', 3: 'upload'},
@@ -154,16 +152,18 @@ def detect():
             'subscription_type': {0: 'business', 1: 'free', 2: 'premium'}
         }
 
-        # Apply mappings if the columns exist
         for col, mapping_dict in mappings.items():
             if col in df_export.columns:
-                # Map values. fillna keeps the original number if no match found (safety)
-                df_export[col] = df_export[col].map(mapping_dict).fillna(df_export[col])
+                df_export[col] = df_export[col].astype(int).map(mapping_dict).fillna(df_export[col])
 
         # 2. Format Timestamp
         df_export['timestamp'] = df_export['timestamp_dt'].astype(str)
 
-        # 3. Smart Column Reordering
+        # 3. FIX: Drop helper columns so they don't show in UI
+        cols_to_drop = ['timestamp_dt', 'signup_date_dt']
+        df_export = df_export.drop(columns=[c for c in cols_to_drop if c in df_export.columns])
+
+        # 4. Smart Column Reordering
         priority_id_cols = ['user_id', 'client_id', 'id', 'username', 'user']
         display_id_col = 'user_id'
         for col in df_export.columns:
@@ -171,12 +171,13 @@ def detect():
                 display_id_col = col
                 break
 
-        cols_priority = ['anomaly_label', 'anomaly_score', display_id_col, 'timestamp', 'operation', 'file_type', 'country', 'subscription_type']
+        # Define STRICT order: ID -> Result -> Time -> Details
+        cols_priority = [display_id_col, 'anomaly_label', 'anomaly_score', 'timestamp', 'country', 'operation', 'file_type', 'subscription_type']
         cols_rest = [c for c in df_export.columns if c not in cols_priority]
         final_order = [c for c in (cols_priority + cols_rest) if c in df_export.columns]
         df_export = df_export[final_order]
 
-        # 4. Final Clean
+        # 5. Final Clean
         df_export = df_export.replace([np.inf, -np.inf], "").fillna("")
 
         return jsonify({
