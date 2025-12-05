@@ -177,8 +177,14 @@ def detect():
         final_order = [c for c in (cols_priority + cols_rest) if c in df_export.columns]
         df_export = df_export[final_order]
 
-        # 5. Final Clean
+       # 5. Final Clean
         df_export = df_export.replace([np.inf, -np.inf], "").fillna("")
+
+        # --- NEW SORTING LOGIC ---
+        # Sort by User ID so 1 comes before 10, 10 before 71, etc.
+        if display_id_col in df_export.columns:
+            df_export = df_export.sort_values(by=display_id_col, ascending=True)
+        # -------------------------
 
         return jsonify({
             "summary": summary,
