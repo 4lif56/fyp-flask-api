@@ -226,8 +226,8 @@ def detect():
         df_export = df_export.replace([np.inf, -np.inf], "").fillna("")
 
         # 8. Sort by User ID (Ascending)
-        if display_id_col in df_export.columns:
-             df_export = df_export.sort_values(by=display_id_col, ascending=True)
+        #if display_id_col in df_export.columns:
+             #df_export = df_export.sort_values(by=display_id_col, ascending=True)
 
         return jsonify({
             "summary": summary,
