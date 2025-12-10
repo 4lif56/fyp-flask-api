@@ -11,13 +11,10 @@ import numpy as np
 app = Flask(__name__)
 CORS(app)
 
-# --- FIX 1: DISABLE ALPHABETICAL SORTING ---
 app.json.sort_keys = False 
 
 def smart_rename(df):
-    """
-    Scans columns and renames them to standard names if they match common keywords.
-    """
+    """ Scans columns and renames them to standard names. """
     column_mappings = {
         'timestamp': ['date', 'time', 'created_at', 'datetime', 'log_time', 'event_time'],
         'user_id': ['id', 'client_id', 'customer_id', 'account_id', 'username', 'user'],
@@ -45,28 +42,25 @@ def smart_rename(df):
     return df
 
 def preprocess_data(df):
-    """
-    Cleans and prepares the uploaded CSV file.
-    """
+    """ Cleans and prepares the uploaded CSV file (Crash-Proof Version). """
     # 1. SMART RENAMING
     df = smart_rename(df)
 
-    # 2. CRITICAL CHECK: Timestamp
+    # 2. SAFE TIMESTAMP PARSING (Crash Proof)
     if 'timestamp' not in df.columns:
-        raise ValueError("Critical Error: No 'timestamp' or 'date' column found.")
+        df['timestamp_dt'] = pd.to_datetime('2024-01-01') # Default date
+    else:
+        df['timestamp_dt'] = pd.to_datetime(df['timestamp'], errors='coerce', infer_datetime_format=True)
+        df['timestamp_dt'] = df['timestamp_dt'].fillna(pd.to_datetime('2024-01-01'))
 
-    # 3. UNIVERSAL TIME PARSING
-    df['timestamp_dt'] = pd.to_datetime(df['timestamp'], errors='coerce', infer_datetime_format=True)
-    df = df.dropna(subset=['timestamp_dt'])
-
-    # 4. SIGNUP DATE
+    # 3. SAFE SIGNUP DATE
     if 'signup_date' in df.columns:
         df['signup_date_dt'] = pd.to_datetime(df['signup_date'], errors='coerce', infer_datetime_format=True)
         df['signup_date_dt'] = df['signup_date_dt'].fillna(df['timestamp_dt'])
     else:
         df['signup_date_dt'] = df['timestamp_dt']
 
-    # 5. FEATURE ENGINEERING
+    # 4. FEATURE ENGINEERING
     df['account_age_days'] = (df['timestamp_dt'] - df['signup_date_dt']).dt.days
     df['day_of_week'] = df['timestamp_dt'].dt.dayofweek
     df['is_weekend'] = df['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
@@ -74,13 +68,13 @@ def preprocess_data(df):
     if 'hour' not in df.columns:
         df['hour'] = df['timestamp_dt'].dt.hour
 
-    # 6. HANDLE SUCCESS
+    # 5. HANDLE SUCCESS
     if 'success' in df.columns:
         df['success'] = df['success'].apply(lambda x: 1 if str(x).lower() in ['true', '1', 'yes', 'success'] else 0)
     else:
         df['success'] = 1 
 
-    # 7. HANDLE NUMERIC COLUMNS
+    # 6. HANDLE NUMERIC COLUMNS (Fill missing with 0)
     numeric_features = [
         'file_size', 'storage_limit', 'subscription_type',
         'country', 'operation', 'user_id', 'file_type', 'hour'
@@ -92,7 +86,7 @@ def preprocess_data(df):
         else:
             df[col] = 0 
 
-    # 8. FINAL FEATURE SELECTION
+    # 7. FINAL FEATURE SELECTION
     feature_columns = [
         'user_id', 'operation', 'file_type', 'file_size', 'success',
         'subscription_type', 'storage_limit', 'country', 'hour',
@@ -106,146 +100,118 @@ def preprocess_data(df):
 @app.route('/detect', methods=['POST'])
 def detect():
     try:
-        if 'file' not in request.files:
-            return jsonify({"error": "No file uploaded"}), 400
+        # 1. SUPPORT MULTIPLE FILES
+        uploaded_files = request.files.getlist("files") # Multiple files?
+        if not uploaded_files and 'file' in request.files:
+             uploaded_files = [request.files['file']] # Fallback to single file
+
+        if not uploaded_files:
+            return jsonify({"error": "No files uploaded"}), 400
             
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({"error": "No file selected"}), 400
-            
+        df = None
+
+        # 2. MERGE LOGIC
         try:
-            df_original = pd.read_csv(file, encoding='utf-8-sig') 
+            if len(uploaded_files) == 1:
+                df = pd.read_csv(uploaded_files[0], encoding='utf-8-sig')
+            elif len(uploaded_files) == 2:
+                df1 = pd.read_csv(uploaded_files[0], encoding='utf-8-sig')
+                df2 = pd.read_csv(uploaded_files[1], encoding='utf-8-sig')
+                
+                # Identify which file is which
+                if 'timestamp' in df1.columns or 'date' in df1.columns:
+                    storage_df, meta_df = df1, df2
+                else:
+                    storage_df, meta_df = df2, df1
+                
+                if 'user_id' in storage_df.columns and 'user_id' in meta_df.columns:
+                    df = pd.merge(storage_df, meta_df, on='user_id', how='left')
+                else:
+                    return jsonify({"error": "Files must both have 'user_id' to merge."}), 400
         except Exception as e:
-            return jsonify({"error": f"Could not read CSV file: {str(e)}"}), 400
-        
+             return jsonify({"error": f"Error merging files: {str(e)}"}), 400
+
         # --- PREPROCESS ---
         try:
-            df, feature_columns = preprocess_data(df_original.copy())
+            df, feature_columns = preprocess_data(df.copy())
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
 
         if df.empty:
-            return jsonify({"error": "No valid data left after preprocessing."}), 400
+            return jsonify({"error": "No valid data."}), 400
 
         # --- SCALE & MODEL (Isolation Forest) ---
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(df[feature_columns])
 
-        # 1. Run Isolation Forest (Unsupervised)
         iso = IsolationForest(contamination=0.01, random_state=42)
         predictions = iso.fit_predict(X_scaled)
 
         df['anomaly_score'] = predictions
         df['anomaly_label'] = df['anomaly_score'].map({1: 'Normal', -1: 'Anomaly'})
 
-        # --- NEW: REAL-TIME BENCHMARKING (Comparison) ---
-        # We use the Isolation Forest predictions as the "Ground Truth" (y)
-        # to see how well Supervised models (RF, LR) can learn these patterns.
-        
-        y_pseudo_truth = [1 if x == -1 else 0 for x in predictions] # 1 = Anomaly, 0 = Normal
-
-        # Split data for validation
-        # Stratify ensures we have anomalies in both train and test sets
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_scaled, y_pseudo_truth, test_size=0.3, random_state=42, stratify=y_pseudo_truth
-        )
-
+        # --- REAL-TIME BENCHMARKING (Supervised Check) ---
         benchmarks_data = []
+        if len(df) > 10: # Only benchmark if we have enough data
+            y_pseudo = [1 if x == -1 else 0 for x in predictions]
+            try:
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X_scaled, y_pseudo, test_size=0.3, random_state=42, stratify=y_pseudo
+                )
+                
+                # A. Random Forest
+                rf = RandomForestClassifier(n_estimators=50, random_state=42)
+                rf.fit(X_train, y_train)
+                y_pred_rf = rf.predict(X_test)
+                p_rf, r_rf, f1_rf, _ = precision_recall_fscore_support(y_test, y_pred_rf, average='binary', zero_division=0)
+                benchmarks_data.append({"name": "Random Forest", "Precision": round(p_rf, 2), "Recall": round(r_rf, 2), "F1": round(f1_rf, 2)})
 
-        # A. Random Forest
-        try:
-            rf = RandomForestClassifier(n_estimators=50, random_state=42) # n_estimators=50 for speed
-            rf.fit(X_train, y_train)
-            y_pred_rf = rf.predict(X_test)
-            # Calculate metrics for the "Anomaly" class (1)
-            prec_rf, rec_rf, f1_rf, _ = precision_recall_fscore_support(y_test, y_pred_rf, average='binary', zero_division=0)
-            
-            benchmarks_data.append({
-                "name": "Random Forest",
-                "Precision": round(prec_rf, 2),
-                "Recall": round(rec_rf, 2),
-                "F1": round(f1_rf, 2)
-            })
-        except Exception as e:
-            print(f"RF Error: {e}")
+                # B. Logistic Regression
+                lr = LogisticRegression(random_state=42, max_iter=200)
+                lr.fit(X_train, y_train)
+                y_pred_lr = lr.predict(X_test)
+                p_lr, r_lr, f1_lr, _ = precision_recall_fscore_support(y_test, y_pred_lr, average='binary', zero_division=0)
+                benchmarks_data.append({"name": "Logistic Regression", "Precision": round(p_lr, 2), "Recall": round(r_lr, 2), "F1": round(f1_lr, 2)})
+            except Exception:
+                pass
 
-        # B. Logistic Regression
-        try:
-            lr = LogisticRegression(random_state=42, max_iter=200)
-            lr.fit(X_train, y_train)
-            y_pred_lr = lr.predict(X_test)
-            # Calculate metrics
-            prec_lr, rec_lr, f1_lr, _ = precision_recall_fscore_support(y_test, y_pred_lr, average='binary', zero_division=0)
-
-            benchmarks_data.append({
-                "name": "Logistic Regression",
-                "Precision": round(prec_lr, 2),
-                "Recall": round(rec_lr, 2),
-                "F1": round(f1_lr, 2)
-            })
-        except Exception as e:
-            print(f"LR Error: {e}")
-
-        # --- SUMMARY ---
+        # --- SUMMARY & EXPORT ---
         summary = {
             "total_rows": len(df),
             "anomalies": int((df['anomaly_label'] == 'Anomaly').sum())
         }
 
-        # --- PREPARE JSON OUTPUT ---
         df_export = df.copy()
-        
-        # 1. TRANSLATE CODES BACK TO NAMES
-        mappings = {
-            'country': {0: 'DE', 1: 'FR', 2: 'GB', 3: 'PL', 4: 'UA', 5: 'US'},
-            'operation': {0: 'delete', 1: 'download', 2: 'modify', 3: 'upload'},
-            'file_type': {0: 'archive', 1: 'document', 2: 'photo', 3: 'video'},
-            'subscription_type': {0: 'business', 1: 'free', 2: 'premium'},
-            'success': {1: 'Success', 0: 'Failed'} 
-        }
-
-        for col, mapping_dict in mappings.items():
-            if col in df_export.columns:
-                df_export[col] = df_export[col].astype(int).map(mapping_dict).fillna(df_export[col])
-
-        # 2. BEAUTIFY "DAY OF WEEK" & "WEEKEND"
-        day_mapping = {0: 'Mon', 1: 'Tue', 2: 'Wed', 3: 'Thu', 4: 'Fri', 5: 'Sat', 6: 'Sun'}
-        weekend_mapping = {0: 'No', 1: 'Yes'}
-        
-        if 'day_of_week' in df_export.columns:
-            df_export['day_of_week'] = df_export['day_of_week'].map(day_mapping)
-        
-        if 'is_weekend' in df_export.columns:
-            df_export['is_weekend'] = df_export['is_weekend'].map(weekend_mapping)
-
-        # 3. Format Timestamp
         df_export['timestamp'] = df_export['timestamp_dt'].astype(str)
-
-        # 4. Remove Helper Columns
         cols_to_drop = ['timestamp_dt', 'signup_date_dt']
         df_export = df_export.drop(columns=[c for c in cols_to_drop if c in df_export.columns])
 
-        # 5. RENAME COLUMNS TO BE HUMAN-READABLE
+        # Renaming
         pretty_names = {
-            'user_id': 'User ID',
-            'anomaly_label': 'Status',
-            'anomaly_score': 'Risk Score',
-            'timestamp': 'Time',
-            'country': 'Country',
-            'operation': 'Action',
-            'file_type': 'File Type', 
-            'file_size': 'Size',
-            'subscription_type': 'Plan', 
-            'account_age_days': 'Account Age',
-            'is_weekend': 'Weekend',
-            'day_of_week': 'Day',
-            'storage_limit': 'Limit',
-            'success': 'Success',
-            'hour': 'Hour of Day'
+            'user_id': 'User ID', 'anomaly_label': 'Status', 'anomaly_score': 'Risk Score',
+            'timestamp': 'Time', 'country': 'Country', 'operation': 'Action',
+            'file_type': 'File Type', 'file_size': 'Size', 'subscription_type': 'Plan',
+            'account_age_days': 'Account Age', 'is_weekend': 'Weekend', 'day_of_week': 'Day',
+            'storage_limit': 'Limit', 'success': 'Success', 'hour': 'Hour of Day'
         }
         df_export = df_export.rename(columns=pretty_names)
 
-        # 6. Smart Column Reordering
+        # Mappings
+        mappings = {
+            'Country': {0: 'DE', 1: 'FR', 2: 'GB', 3: 'PL', 4: 'UA', 5: 'US'},
+            'Action': {0: 'delete', 1: 'download', 2: 'modify', 3: 'upload'},
+            'File Type': {0: 'archive', 1: 'document', 2: 'photo', 3: 'video'},
+            'Plan': {0: 'business', 1: 'free', 2: 'premium'},
+            'Weekend': {0: 'No', 1: 'Yes'},
+            'Success': {1: 'Success', 0: 'Failed'}
+        }
+        for col, mapping_dict in mappings.items():
+            if col in df_export.columns:
+                 # Ensure we only map numeric columns (prevents re-mapping strings)
+                 if pd.api.types.is_numeric_dtype(df_export[col]):
+                     df_export[col] = df_export[col].astype(int).map(mapping_dict).fillna(df_export[col])
+
+        # Reorder
         display_id_col = 'User ID' 
         if display_id_col not in df_export.columns:
              for col in df_export.columns:
@@ -253,32 +219,15 @@ def detect():
                      display_id_col = col
                      break
         
-        desired_order = [
-            display_id_col, 
-            'Status', 
-            'Risk Score', 
-            'Time', 
-            'Country', 
-            'Action', 
-            'File Type', 
-            'Plan', 
-            'Size', 
-            'Limit',
-            'Weekend',
-            'Day',
-            'Account Age'
-        ]
-        
+        desired_order = [display_id_col, 'Status', 'Risk Score', 'Time', 'Country', 'Action', 'File Type', 'Plan', 'Size']
         existing_cols = df_export.columns.tolist()
         final_order = [c for c in desired_order if c in existing_cols] + [c for c in existing_cols if c not in desired_order]
-        df_export = df_export[final_order]
-
-        # 7. Final Clean
-        df_export = df_export.replace([np.inf, -np.inf], "").fillna("")
+        
+        df_export = df_export[final_order].replace([np.inf, -np.inf], "").fillna("")
 
         return jsonify({
             "summary": summary,
-            "benchmarks": benchmarks_data,  # Sending the Real-Time Comparison
+            "benchmarks": benchmarks_data,
             "results": df_export.to_dict(orient="records")
         })
 
