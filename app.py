@@ -1,8 +1,11 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pandas as pd
-from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import precision_recall_fscore_support
 import numpy as np
 
 app = Flask(__name__)
@@ -124,15 +127,64 @@ def detect():
         if df.empty:
             return jsonify({"error": "No valid data left after preprocessing."}), 400
 
-        # --- SCALE & MODEL ---
+        # --- SCALE & MODEL (Isolation Forest) ---
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(df[feature_columns])
 
+        # 1. Run Isolation Forest (Unsupervised)
         iso = IsolationForest(contamination=0.01, random_state=42)
         predictions = iso.fit_predict(X_scaled)
 
         df['anomaly_score'] = predictions
         df['anomaly_label'] = df['anomaly_score'].map({1: 'Normal', -1: 'Anomaly'})
+
+        # --- NEW: REAL-TIME BENCHMARKING (Comparison) ---
+        # We use the Isolation Forest predictions as the "Ground Truth" (y)
+        # to see how well Supervised models (RF, LR) can learn these patterns.
+        
+        y_pseudo_truth = [1 if x == -1 else 0 for x in predictions] # 1 = Anomaly, 0 = Normal
+
+        # Split data for validation
+        # Stratify ensures we have anomalies in both train and test sets
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_scaled, y_pseudo_truth, test_size=0.3, random_state=42, stratify=y_pseudo_truth
+        )
+
+        benchmarks_data = []
+
+        # A. Random Forest
+        try:
+            rf = RandomForestClassifier(n_estimators=50, random_state=42) # n_estimators=50 for speed
+            rf.fit(X_train, y_train)
+            y_pred_rf = rf.predict(X_test)
+            # Calculate metrics for the "Anomaly" class (1)
+            prec_rf, rec_rf, f1_rf, _ = precision_recall_fscore_support(y_test, y_pred_rf, average='binary', zero_division=0)
+            
+            benchmarks_data.append({
+                "name": "Random Forest",
+                "Precision": round(prec_rf, 2),
+                "Recall": round(rec_rf, 2),
+                "F1": round(f1_rf, 2)
+            })
+        except Exception as e:
+            print(f"RF Error: {e}")
+
+        # B. Logistic Regression
+        try:
+            lr = LogisticRegression(random_state=42, max_iter=200)
+            lr.fit(X_train, y_train)
+            y_pred_lr = lr.predict(X_test)
+            # Calculate metrics
+            prec_lr, rec_lr, f1_lr, _ = precision_recall_fscore_support(y_test, y_pred_lr, average='binary', zero_division=0)
+
+            benchmarks_data.append({
+                "name": "Logistic Regression",
+                "Precision": round(prec_lr, 2),
+                "Recall": round(rec_lr, 2),
+                "F1": round(f1_lr, 2)
+            })
+        except Exception as e:
+            print(f"LR Error: {e}")
 
         # --- SUMMARY ---
         summary = {
@@ -148,14 +200,15 @@ def detect():
             'country': {0: 'DE', 1: 'FR', 2: 'GB', 3: 'PL', 4: 'UA', 5: 'US'},
             'operation': {0: 'delete', 1: 'download', 2: 'modify', 3: 'upload'},
             'file_type': {0: 'archive', 1: 'document', 2: 'photo', 3: 'video'},
-            'subscription_type': {0: 'business', 1: 'free', 2: 'premium'}
+            'subscription_type': {0: 'business', 1: 'free', 2: 'premium'},
+            'success': {1: 'Success', 0: 'Failed'} 
         }
 
         for col, mapping_dict in mappings.items():
             if col in df_export.columns:
                 df_export[col] = df_export[col].astype(int).map(mapping_dict).fillna(df_export[col])
 
-        # 2. BEAUTIFY "DAY OF WEEK" & "WEEKEND" (New Feature!)
+        # 2. BEAUTIFY "DAY OF WEEK" & "WEEKEND"
         day_mapping = {0: 'Mon', 1: 'Tue', 2: 'Wed', 3: 'Thu', 4: 'Fri', 5: 'Sat', 6: 'Sun'}
         weekend_mapping = {0: 'No', 1: 'Yes'}
         
@@ -172,17 +225,17 @@ def detect():
         cols_to_drop = ['timestamp_dt', 'signup_date_dt']
         df_export = df_export.drop(columns=[c for c in cols_to_drop if c in df_export.columns])
 
-        # 5. RENAME COLUMNS TO BE HUMAN-READABLE (Professional Polish)
+        # 5. RENAME COLUMNS TO BE HUMAN-READABLE
         pretty_names = {
             'user_id': 'User ID',
             'anomaly_label': 'Status',
-            'anomaly_score': 'Risk Score',  # "Risk Score" sounds more professional than just "Score"
+            'anomaly_score': 'Risk Score',
             'timestamp': 'Time',
             'country': 'Country',
             'operation': 'Action',
-            'file_type': 'File Type',       # Removed underscore
+            'file_type': 'File Type', 
             'file_size': 'Size',
-            'subscription_type': 'Plan',    # "Plan" is cleaner than "Subscription Type"
+            'subscription_type': 'Plan', 
             'account_age_days': 'Account Age',
             'is_weekend': 'Weekend',
             'day_of_week': 'Day',
@@ -192,18 +245,16 @@ def detect():
         }
         df_export = df_export.rename(columns=pretty_names)
 
-        # 6. Smart Column Reordering (Using New Names)
-        # We need to look for the NEW names now
+        # 6. Smart Column Reordering
         display_id_col = 'User ID' 
         if display_id_col not in df_export.columns:
              for col in df_export.columns:
-                 if 'User' in col or 'ID' in col: # Check for capitalized versions now
+                 if 'User' in col or 'ID' in col:
                      display_id_col = col
                      break
         
-        # Define STRICT order using the PROFESSIONAL Names
         desired_order = [
-            display_id_col,   # User ID
+            display_id_col, 
             'Status', 
             'Risk Score', 
             'Time', 
@@ -225,12 +276,9 @@ def detect():
         # 7. Final Clean
         df_export = df_export.replace([np.inf, -np.inf], "").fillna("")
 
-        # 8. Sort by User ID (Ascending)
-        #if display_id_col in df_export.columns:
-             #df_export = df_export.sort_values(by=display_id_col, ascending=True)
-
         return jsonify({
             "summary": summary,
+            "benchmarks": benchmarks_data,  # Sending the Real-Time Comparison
             "results": df_export.to_dict(orient="records")
         })
 
