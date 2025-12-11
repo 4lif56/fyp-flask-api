@@ -60,13 +60,14 @@ def preprocess_data(df):
 
     if 'signup_date' in df.columns:
         signup_dt = pd.to_datetime(df['signup_date'], errors='coerce').fillna(df['timestamp_dt'])
-        df['account_age_days'] = (df['timestamp_dt'] - signup_dt).dt.days.astype('int16')
+        df['account_age_days'] = (df['timestamp_dt'] - signup_dt).dt.days.fillna(0).astype('int16')
     else:
         df['account_age_days'] = 0
 
-    df['day_of_week'] = df['timestamp_dt'].dt.dayofweek.astype('int8')
+    df['day_of_week'] = df['timestamp_dt'].dt.dayofweek.fillna(0).astype('int8')
     df['is_weekend'] = (df['day_of_week'] >= 5).astype('int8')
     
+    # Logic: If hour exists, use it. If not, extract from timestamp.
     if 'hour' not in df.columns:
         df['hour'] = df['timestamp_dt'].dt.hour.fillna(0).astype('int8')
 
@@ -75,7 +76,8 @@ def preprocess_data(df):
     else:
         df['success'] = 1
 
-    req_cols = ['file_size', 'storage_limit', 'subscription_type', 'country', 'operation', 'user_id', 'file_type']
+    # CRITICAL FIX: Added 'hour' to this list to ensure it gets cleaned if it existed in CSV
+    req_cols = ['file_size', 'storage_limit', 'subscription_type', 'country', 'operation', 'user_id', 'file_type', 'hour']
     for c in req_cols:
         if c not in df.columns:
             df[c] = 0
@@ -87,6 +89,10 @@ def preprocess_data(df):
         'subscription_type', 'storage_limit', 'country', 'hour',
         'account_age_days', 'day_of_week', 'is_weekend'
     ]
+    
+    # FINAL SANITY CHECK: Fill any remaining NaNs in feature columns
+    df[features] = df[features].fillna(0)
+    
     return df, features
 
 @app.route('/detect', methods=['POST'])
@@ -111,6 +117,9 @@ def detect():
         # --- MEMORY OPTIMIZATION ---
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(df[feature_cols]).astype(np.float32)
+        
+        # 🔥 NUCLEAR FIX: Replace any remaining NaNs or Infinity with 0
+        X_scaled = np.nan_to_num(X_scaled)
 
         # --- MODEL 1: ISOLATION FOREST ---
         iso = IsolationForest(contamination=0.01, n_estimators=100, n_jobs=1, random_state=42)
@@ -146,15 +155,12 @@ def detect():
             del lr
             gc.collect()
 
-        # --- NEW: TIMELINE AGGREGATION (With Fixed Indentation) ---
+        # --- TIMELINE AGGREGATION ---
         df['dt_temp'] = df['timestamp_dt']
-        
-        # Group by Date and Label
         timeline_groups = df.groupby([df['dt_temp'].dt.date, 'anomaly_label']).size().unstack(fill_value=0)
         
         timeline_data = []
         for date, row in timeline_groups.iterrows():
-            # Use .get() safely because sometimes 'Normal' or 'Anomaly' columns might be missing
             timeline_data.append({
                 "date": str(date),
                 "Normal": int(row.get('Normal', 0)),
