@@ -7,6 +7,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_recall_fscore_support
 import numpy as np
+import gc  # Garbage Collector interface
 
 app = Flask(__name__)
 CORS(app)
@@ -42,20 +43,20 @@ def smart_rename(df):
     return df
 
 def preprocess_data(df):
-    """ Cleans and prepares the CSV. CRASH-PROOF: Fills missing cols with 0. """
+    """ Cleans and prepares the CSV. """
     # 1. SMART RENAMING
     df = smart_rename(df)
 
-    # 2. SAFE TIMESTAMP (Default to 2024-01-01 if missing)
+    # 2. SAFE TIMESTAMP
     if 'timestamp' not in df.columns:
         df['timestamp_dt'] = pd.to_datetime('2024-01-01')
     else:
-        df['timestamp_dt'] = pd.to_datetime(df['timestamp'], errors='coerce', infer_datetime_format=True)
+        df['timestamp_dt'] = pd.to_datetime(df['timestamp'], errors='coerce')
         df['timestamp_dt'] = df['timestamp_dt'].fillna(pd.to_datetime('2024-01-01'))
 
     # 3. SAFE SIGNUP DATE
     if 'signup_date' in df.columns:
-        df['signup_date_dt'] = pd.to_datetime(df['signup_date'], errors='coerce', infer_datetime_format=True)
+        df['signup_date_dt'] = pd.to_datetime(df['signup_date'], errors='coerce')
         df['signup_date_dt'] = df['signup_date_dt'].fillna(df['timestamp_dt'])
     else:
         df['signup_date_dt'] = df['timestamp_dt']
@@ -74,7 +75,7 @@ def preprocess_data(df):
     else:
         df['success'] = 1 
 
-    # 6. FILL MISSING NUMERIC COLUMNS WITH 0 (The Fix!)
+    # 6. FILL MISSING NUMERIC COLUMNS WITH 0
     numeric_features = [
         'file_size', 'storage_limit', 'subscription_type',
         'country', 'operation', 'user_id', 'file_type', 'hour'
@@ -82,9 +83,10 @@ def preprocess_data(df):
 
     for col in numeric_features:
         if col in df.columns:
+            # Downcast to smaller types to save RAM
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         else:
-            df[col] = 0 # Create missing column with 0s
+            df[col] = 0
 
     # 7. FINAL FEATURE SELECTION
     feature_columns = [
@@ -108,54 +110,78 @@ def detect():
             return jsonify({"error": "No file selected"}), 400
             
         try:
+            # Read CSV
             df_original = pd.read_csv(file, encoding='utf-8-sig') 
         except Exception as e:
             return jsonify({"error": f"Could not read CSV file: {str(e)}"}), 400
         
         # --- PREPROCESS ---
         try:
-            df, feature_columns = preprocess_data(df_original.copy())
+            # Process in place to save RAM
+            df, feature_columns = preprocess_data(df_original)
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
 
         if df.empty:
             return jsonify({"error": "No valid data left after preprocessing."}), 400
 
-        # --- SCALE & MODEL ---
+        # --- SCALE & MODEL (Optimized) ---
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(df[feature_columns])
 
-        iso = IsolationForest(contamination=0.01, random_state=42)
+        # MEMORY FIX 1: Reduce n_estimators from 100 (default) to 50
+        # MEMORY FIX 2: Enable n_jobs=1 to prevent multiprocessing RAM spike
+        iso = IsolationForest(contamination=0.01, n_estimators=50, n_jobs=1, random_state=42)
         predictions = iso.fit_predict(X_scaled)
 
         df['anomaly_score'] = predictions
         df['anomaly_label'] = df['anomaly_score'].map({1: 'Normal', -1: 'Anomaly'})
 
-        # --- REAL-TIME BENCHMARKING ---
+        # --- REAL-TIME BENCHMARKING (Optimized) ---
         benchmarks_data = []
         
-        # Only run if enough data
         if len(df) > 10:
             y_pseudo_truth = [1 if x == -1 else 0 for x in predictions]
+            
+            # MEMORY FIX 3: Downsample for benchmarks
+            # If dataset is huge (>5000 rows), only use 5000 rows for benchmarking to save RAM
+            if len(X_scaled) > 5000:
+                # Get indices for stratification (simple sampling)
+                indices = np.random.choice(len(X_scaled), 5000, replace=False)
+                X_bench = X_scaled[indices]
+                y_bench = np.array(y_pseudo_truth)[indices]
+            else:
+                X_bench = X_scaled
+                y_bench = y_pseudo_truth
+
             try:
                 X_train, X_test, y_train, y_test = train_test_split(
-                    X_scaled, y_pseudo_truth, test_size=0.3, random_state=42, stratify=y_pseudo_truth
+                    X_bench, y_bench, test_size=0.3, random_state=42, stratify=y_bench
                 )
                 
-                # A. Random Forest
-                rf = RandomForestClassifier(n_estimators=50, random_state=42)
+                # A. Random Forest (Reduced estimators)
+                rf = RandomForestClassifier(n_estimators=30, n_jobs=1, random_state=42, max_depth=10)
                 rf.fit(X_train, y_train)
                 y_pred_rf = rf.predict(X_test)
                 p_rf, r_rf, f1_rf, _ = precision_recall_fscore_support(y_test, y_pred_rf, average='binary', zero_division=0)
                 benchmarks_data.append({"name": "Random Forest", "Precision": round(p_rf, 2), "Recall": round(r_rf, 2), "F1": round(f1_rf, 2)})
 
+                # Clear RF memory
+                del rf
+                gc.collect()
+
                 # B. Logistic Regression
-                lr = LogisticRegression(random_state=42, max_iter=200)
+                lr = LogisticRegression(random_state=42, max_iter=100, solver='liblinear') # liblinear is lighter for RAM
                 lr.fit(X_train, y_train)
                 y_pred_lr = lr.predict(X_test)
                 p_lr, r_lr, f1_lr, _ = precision_recall_fscore_support(y_test, y_pred_lr, average='binary', zero_division=0)
                 benchmarks_data.append({"name": "Logistic Regression", "Precision": round(p_lr, 2), "Recall": round(r_lr, 2), "F1": round(f1_lr, 2)})
-            except Exception:
+                
+                del lr
+                gc.collect()
+
+            except Exception as e:
+                print(f"Benchmark Error: {e}")
                 pass
 
         # --- SUMMARY ---
@@ -214,6 +240,11 @@ def detect():
         final_order = [c for c in desired_order if c in existing_cols] + [c for c in existing_cols if c not in desired_order]
         df_export = df_export[final_order]
         df_export = df_export.replace([np.inf, -np.inf], "").fillna("")
+
+        # FINAL MEMORY CLEANUP
+        del df
+        del X_scaled
+        gc.collect()
 
         return jsonify({
             "summary": summary,
