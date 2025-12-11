@@ -7,7 +7,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_recall_fscore_support
 import numpy as np
-import gc
+import gc  # Garbage Collector
 
 app = Flask(__name__)
 CORS(app)
@@ -88,7 +88,6 @@ def preprocess_data(df):
         'account_age_days', 'day_of_week', 'is_weekend'
     ]
     
-    # Final cleanup of NaNs
     df[features] = df[features].fillna(0)
     
     return df, features
@@ -115,39 +114,34 @@ def detect():
         # --- MEMORY OPTIMIZATION ---
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(df[feature_cols]).astype(np.float32)
-        X_scaled = np.nan_to_num(X_scaled) # Safety net
+        X_scaled = np.nan_to_num(X_scaled)
 
         # --- MODEL 1: ISOLATION FOREST ---
         iso = IsolationForest(contamination=0.01, n_estimators=100, n_jobs=1, random_state=42)
-        
-        # Get raw scores instead of just labels
-        # Negative scores = Anomalies. The more negative, the worse it is.
         iso.fit(X_scaled)
+        
+        # Get Scores for Risk Calculation
         raw_scores = iso.decision_function(X_scaled)
         predictions = iso.predict(X_scaled)
 
-        # --- NEW: CALCULATE RISK LEVEL (0, 1, 2, 3) ---
+        # --- CALCULATE RISK LEVEL (0, 1, 2, 3) ---
+        # 0 = Normal, 1 = Low, 2 = Med, 3 = High
         def get_risk_level(score, pred):
-            if pred == 1: 
-                return 0 # Normal
-            # Anomalies (pred == -1) have negative scores
-            # Based on your data distribution:
-            if score < -0.025: return 3 # Critical (Bottom 33% of anomalies)
-            if score < -0.008: return 2 # Medium
-            return 1 # Low
+            if pred == 1: return 0 
+            if score < -0.025: return 3
+            if score < -0.008: return 2
+            return 1
 
-        # Vectorize the function for speed
         v_get_risk = np.vectorize(get_risk_level)
         risk_levels = v_get_risk(raw_scores, predictions)
 
-        df['anomaly_score'] = risk_levels # Now stores 0, 1, 2, 3
+        df['anomaly_score'] = risk_levels
         df['anomaly_label'] = np.where(predictions == -1, 'Anomaly', 'Normal')
 
         # --- MODEL 2: BENCHMARKS ---
         benchmarks_data = []
         if len(df) > 10:
             y_truth = np.where(predictions == -1, 1, 0)
-            
             X_train, X_test, y_train, y_test = train_test_split(
                 X_scaled, y_truth, test_size=0.3, random_state=42, stratify=y_truth
             )
@@ -181,7 +175,6 @@ def detect():
                 "Normal": int(row.get('Normal', 0)),
                 "Anomaly": int(row.get('Anomaly', 0))
             })
-            
         timeline_data.sort(key=lambda x: x['date'])
 
         # --- EXPORT ---
@@ -190,7 +183,31 @@ def detect():
             "anomalies": int((df['anomaly_label'] == 'Anomaly').sum())
         }
 
+        # --- PREPARE READABLE EXPORT ---
         df['timestamp'] = df['timestamp_dt'].astype(str)
+        
+        # 🔥 FIX: Map numbers back to words for the Table
+        # Map Country
+        country_map = {0: 'DE', 1: 'FR', 2: 'GB', 3: 'PL', 4: 'UA', 5: 'US'}
+        df['country'] = df['country'].map(country_map).fillna(df['country'])
+        
+        # Map Action
+        action_map = {0: 'delete', 1: 'download', 2: 'modify', 3: 'upload'}
+        df['operation'] = df['operation'].map(action_map).fillna(df['operation'])
+        
+        # Map File Type
+        file_map = {0: 'archive', 1: 'document', 2: 'photo', 3: 'video'}
+        df['file_type'] = df['file_type'].map(file_map).fillna(df['file_type'])
+        
+        # Map Plan
+        plan_map = {0: 'business', 1: 'free', 2: 'premium'}
+        df['subscription_type'] = df['subscription_type'].map(plan_map).fillna(df['subscription_type'])
+        
+        # Map Success
+        success_map = {1: 'Success', 0: 'Failed'}
+        df['success'] = df['success'].map(success_map).fillna(df['success'])
+
+        # Select & Rename Columns
         cols_to_keep = ['user_id', 'anomaly_label', 'anomaly_score', 'timestamp', 'country', 
                         'operation', 'file_type', 'file_size', 'subscription_type', 'success']
         
@@ -205,10 +222,7 @@ def detect():
         }
         df_export.rename(columns=pretty_names, inplace=True)
 
-        country_map = {0: 'DE', 1: 'FR', 2: 'GB', 3: 'PL', 4: 'UA', 5: 'US'}
-        if 'Country' in df_export.columns:
-            df_export['Country'] = df_export['Country'].map(country_map).fillna(df_export['Country'])
-
+        # Cleanup
         del df
         del X_scaled
         gc.collect()
