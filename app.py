@@ -7,7 +7,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_recall_fscore_support
 import numpy as np
-import gc  # Garbage Collector interface
+import gc
 
 app = Flask(__name__)
 CORS(app)
@@ -67,7 +67,6 @@ def preprocess_data(df):
     df['day_of_week'] = df['timestamp_dt'].dt.dayofweek.fillna(0).astype('int8')
     df['is_weekend'] = (df['day_of_week'] >= 5).astype('int8')
     
-    # Logic: If hour exists, use it. If not, extract from timestamp.
     if 'hour' not in df.columns:
         df['hour'] = df['timestamp_dt'].dt.hour.fillna(0).astype('int8')
 
@@ -76,7 +75,6 @@ def preprocess_data(df):
     else:
         df['success'] = 1
 
-    # CRITICAL FIX: Added 'hour' to this list to ensure it gets cleaned if it existed in CSV
     req_cols = ['file_size', 'storage_limit', 'subscription_type', 'country', 'operation', 'user_id', 'file_type', 'hour']
     for c in req_cols:
         if c not in df.columns:
@@ -90,7 +88,7 @@ def preprocess_data(df):
         'account_age_days', 'day_of_week', 'is_weekend'
     ]
     
-    # FINAL SANITY CHECK: Fill any remaining NaNs in feature columns
+    # Final cleanup of NaNs
     df[features] = df[features].fillna(0)
     
     return df, features
@@ -117,16 +115,33 @@ def detect():
         # --- MEMORY OPTIMIZATION ---
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(df[feature_cols]).astype(np.float32)
-        
-        # 🔥 NUCLEAR FIX: Replace any remaining NaNs or Infinity with 0
-        X_scaled = np.nan_to_num(X_scaled)
+        X_scaled = np.nan_to_num(X_scaled) # Safety net
 
         # --- MODEL 1: ISOLATION FOREST ---
         iso = IsolationForest(contamination=0.01, n_estimators=100, n_jobs=1, random_state=42)
-        predictions = iso.fit_predict(X_scaled)
+        
+        # Get raw scores instead of just labels
+        # Negative scores = Anomalies. The more negative, the worse it is.
+        iso.fit(X_scaled)
+        raw_scores = iso.decision_function(X_scaled)
+        predictions = iso.predict(X_scaled)
 
-        df['anomaly_score'] = predictions
-        df['anomaly_label'] = df['anomaly_score'].map({1: 'Normal', -1: 'Anomaly'})
+        # --- NEW: CALCULATE RISK LEVEL (0, 1, 2, 3) ---
+        def get_risk_level(score, pred):
+            if pred == 1: 
+                return 0 # Normal
+            # Anomalies (pred == -1) have negative scores
+            # Based on your data distribution:
+            if score < -0.025: return 3 # Critical (Bottom 33% of anomalies)
+            if score < -0.008: return 2 # Medium
+            return 1 # Low
+
+        # Vectorize the function for speed
+        v_get_risk = np.vectorize(get_risk_level)
+        risk_levels = v_get_risk(raw_scores, predictions)
+
+        df['anomaly_score'] = risk_levels # Now stores 0, 1, 2, 3
+        df['anomaly_label'] = np.where(predictions == -1, 'Anomaly', 'Normal')
 
         # --- MODEL 2: BENCHMARKS ---
         benchmarks_data = []
