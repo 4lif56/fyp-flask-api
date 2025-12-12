@@ -125,7 +125,6 @@ def detect():
         predictions = iso.predict(X_scaled)
 
         # --- CALCULATE RISK LEVEL (0, 1, 2, 3) ---
-        # 0 = Normal, 1 = Low, 2 = Med, 3 = High
         def get_risk_level(score, pred):
             if pred == 1: return 0 
             if score < -0.025: return 3
@@ -186,39 +185,36 @@ def detect():
         # --- PREPARE READABLE EXPORT ---
         df['timestamp'] = df['timestamp_dt'].astype(str)
         
-        # 🔥 FIX: Map numbers back to words for the Table
-        # Map Country
+        # Mappings
         country_map = {0: 'DE', 1: 'FR', 2: 'GB', 3: 'PL', 4: 'UA', 5: 'US'}
         df['country'] = df['country'].map(country_map).fillna(df['country'])
         
-        # Map Action
         action_map = {0: 'delete', 1: 'download', 2: 'modify', 3: 'upload'}
         df['operation'] = df['operation'].map(action_map).fillna(df['operation'])
         
-        # Map File Type
         file_map = {0: 'archive', 1: 'document', 2: 'photo', 3: 'video'}
         df['file_type'] = df['file_type'].map(file_map).fillna(df['file_type'])
         
-        # Map Plan
         plan_map = {0: 'business', 1: 'free', 2: 'premium'}
         df['subscription_type'] = df['subscription_type'].map(plan_map).fillna(df['subscription_type'])
         
-        # Map Success
         success_map = {1: 'Success', 0: 'Failed'}
         df['success'] = df['success'].map(success_map).fillna(df['success'])
 
-        # Select & Rename Columns
-        cols_to_keep = ['user_id', 'anomaly_label', 'anomaly_score', 'timestamp', 'country', 
-                        'operation', 'file_type', 'file_size', 'subscription_type', 'success']
+        # 🔥 UPDATE: KEEP ALL COLUMNS (Removed restrictive filter)
+        df_export = df.copy()
         
-        final_cols = [c for c in cols_to_keep if c in df.columns]
-        df_export = df[final_cols].copy()
+        # Drop only internal calculation columns
+        cols_to_drop = ['timestamp_dt', 'signup_date_dt', 'dt_temp', 'anomaly_score'] 
+        df_export.drop(columns=[c for c in cols_to_drop if c in df_export.columns], inplace=True, errors='ignore')
 
+        # Rename standard columns for UI
         pretty_names = {
             'user_id': 'User ID', 'anomaly_label': 'Status', 'anomaly_score': 'Risk Score',
             'timestamp': 'Time', 'country': 'Country', 'operation': 'Action',
             'file_type': 'File Type', 'file_size': 'Size', 'subscription_type': 'Plan',
-            'success': 'Success'
+            'success': 'Success', 'account_age_days': 'Account Age', 
+            'hour': 'Hour', 'day_of_week': 'Day Index', 'is_weekend': 'Is Weekend'
         }
         df_export.rename(columns=pretty_names, inplace=True)
 
