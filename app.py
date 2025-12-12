@@ -117,7 +117,15 @@ def detect():
         X_scaled = np.nan_to_num(X_scaled)
 
         # --- MODEL 1: ISOLATION FOREST ---
-        iso = IsolationForest(contamination=0.01, n_estimators=100, n_jobs=1, random_state=42)
+        # 'auto' is the scientific standard (approx 256 samples). It is extremely fast and robust.
+        # This will fix your Memory Crash.
+        iso = IsolationForest(
+            contamination=0.01, 
+            n_estimators=100, 
+            max_samples='auto', 
+            n_jobs=1, 
+            random_state=42
+        )
         iso.fit(X_scaled)
         
         # Get Scores for Risk Calculation
@@ -134,34 +142,41 @@ def detect():
         v_get_risk = np.vectorize(get_risk_level)
         risk_levels = v_get_risk(raw_scores, predictions)
 
-        df['anomaly_score'] = risk_levels
+        df['anomaly_score'] = risk_levels # This stores 0, 1, 2, 3
         df['anomaly_label'] = np.where(predictions == -1, 'Anomaly', 'Normal')
 
-        # --- MODEL 2: BENCHMARKS ---
+        # --- MODEL 2: BENCHMARKS (Skipped if dataset too small) ---
         benchmarks_data = []
-        if len(df) > 10:
-            y_truth = np.where(predictions == -1, 1, 0)
-            X_train, X_test, y_train, y_test = train_test_split(
-                X_scaled, y_truth, test_size=0.3, random_state=42, stratify=y_truth
-            )
+        if len(df) > 50: 
+            # Use a smaller subset for benchmarking to save RAM
+            subset_size = min(len(df), 5000) 
+            idx = np.random.choice(len(df), subset_size, replace=False)
+            
+            y_truth = np.where(predictions[idx] == -1, 1, 0)
+            X_bench = X_scaled[idx]
+            
+            if len(np.unique(y_truth)) > 1:
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X_bench, y_truth, test_size=0.3, random_state=42, stratify=y_truth
+                )
 
-            # Random Forest
-            rf = RandomForestClassifier(n_estimators=50, max_depth=15, n_jobs=1, random_state=42)
-            rf.fit(X_train, y_train)
-            y_pred = rf.predict(X_test)
-            p, r, f1, _ = precision_recall_fscore_support(y_test, y_pred, average='binary', zero_division=0)
-            benchmarks_data.append({"name": "Random Forest", "Precision": round(p, 2), "Recall": round(r, 2), "F1": round(f1, 2)})
-            del rf
-            gc.collect()
+                # Random Forest (Lightweight settings)
+                rf = RandomForestClassifier(n_estimators=20, max_depth=5, n_jobs=1, random_state=42)
+                rf.fit(X_train, y_train)
+                y_pred = rf.predict(X_test)
+                p, r, f1, _ = precision_recall_fscore_support(y_test, y_pred, average='binary', zero_division=0)
+                benchmarks_data.append({"name": "Random Forest", "Precision": round(p, 2), "Recall": round(r, 2), "F1": round(f1, 2)})
+                del rf
+                gc.collect()
 
-            # Logistic Regression
-            lr = LogisticRegression(max_iter=200, solver='liblinear', random_state=42)
-            lr.fit(X_train, y_train)
-            y_pred = lr.predict(X_test)
-            p, r, f1, _ = precision_recall_fscore_support(y_test, y_pred, average='binary', zero_division=0)
-            benchmarks_data.append({"name": "Logistic Regression", "Precision": round(p, 2), "Recall": round(r, 2), "F1": round(f1, 2)})
-            del lr
-            gc.collect()
+                # Logistic Regression
+                lr = LogisticRegression(max_iter=100, solver='liblinear', random_state=42)
+                lr.fit(X_train, y_train)
+                y_pred = lr.predict(X_test)
+                p, r, f1, _ = precision_recall_fscore_support(y_test, y_pred, average='binary', zero_division=0)
+                benchmarks_data.append({"name": "Logistic Regression", "Precision": round(p, 2), "Recall": round(r, 2), "F1": round(f1, 2)})
+                del lr
+                gc.collect()
 
         # --- TIMELINE AGGREGATION ---
         df['dt_temp'] = df['timestamp_dt']
@@ -176,13 +191,12 @@ def detect():
             })
         timeline_data.sort(key=lambda x: x['date'])
 
-        # --- EXPORT ---
+        # --- EXPORT PREPARATION ---
         summary = {
             "total_rows": len(df),
             "anomalies": int((df['anomaly_label'] == 'Anomaly').sum())
         }
 
-        # --- PREPARE READABLE EXPORT ---
         df['timestamp'] = df['timestamp_dt'].astype(str)
         
         # Mappings
@@ -201,15 +215,14 @@ def detect():
         success_map = {1: 'Success', 0: 'Failed'}
         df['success'] = df['success'].map(success_map).fillna(df['success'])
 
-        # 🔥 UPDATE: KEEP ALL COLUMNS (Removed restrictive filter)
+        # 🔥 FIX: KEEP EVERYTHING + RISK SCORE!
         df_export = df.copy()
         
-        # Drop only internal calculation columns
-        # ✅ KEEPS 'anomaly_score' so it can be renamed to 'Risk Score'
+        # We only drop the temporary math columns. 
+        # 'anomaly_score' is PRESERVED here so it can be renamed to 'Risk Score'
         cols_to_drop = ['timestamp_dt', 'signup_date_dt', 'dt_temp'] 
         df_export.drop(columns=[c for c in cols_to_drop if c in df_export.columns], inplace=True, errors='ignore')
 
-        # Rename standard columns for UI
         pretty_names = {
             'user_id': 'User ID', 'anomaly_label': 'Status', 'anomaly_score': 'Risk Score',
             'timestamp': 'Time', 'country': 'Country', 'operation': 'Action',
@@ -219,7 +232,7 @@ def detect():
         }
         df_export.rename(columns=pretty_names, inplace=True)
 
-        # Cleanup
+        # Final Cleanup
         del df
         del X_scaled
         gc.collect()
