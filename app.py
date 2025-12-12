@@ -205,7 +205,8 @@ def detect():
         df_export = df.copy()
         
         # Drop only internal calculation columns
-        cols_to_drop = ['timestamp_dt', 'signup_date_dt', 'dt_temp', 'anomaly_score'] 
+        # ✅ KEEPS 'anomaly_score' so it can be renamed to 'Risk Score'
+        cols_to_drop = ['timestamp_dt', 'signup_date_dt', 'dt_temp'] 
         df_export.drop(columns=[c for c in cols_to_drop if c in df_export.columns], inplace=True, errors='ignore')
 
         # Rename standard columns for UI
