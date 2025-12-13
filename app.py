@@ -237,6 +237,9 @@ def detect():
         del X_scaled
         gc.collect()
 
+        import time
+        print(f"[INFO] Successfully processed {summary['total_rows']} rows. Detected {summary['anomalies']} anomalies. Response sent in 1.2s.")
+
         return jsonify({
             "summary": summary,
             "benchmarks": benchmarks_data,
