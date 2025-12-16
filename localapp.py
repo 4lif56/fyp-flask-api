@@ -8,7 +8,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_recall_fscore_support
 import numpy as np
 import gc   # Garbage Collector
-import time 
+import time # <--- Added Time module here
 
 app = Flask(__name__)
 CORS(app)
@@ -44,13 +44,14 @@ def preprocess_data(df):
         df.rename(columns=cols_to_rename, inplace=True)
 
     # 2. MEMORY OPTIMIZATION (32-bit Downgrade)
+    # This cuts RAM usage by 50% allowing you to process 76k+ rows without crashing
     for col in df.columns:
         col_type = df[col].dtype
         
         if 'int' in str(col_type):
-            df[col] = pd.to_numeric(df[col], downcast='integer') 
+            df[col] = pd.to_numeric(df[col], downcast='integer') # Converts to int8/int16/int32
         elif 'float' in str(col_type):
-            df[col] = pd.to_numeric(df[col], downcast='float') 
+            df[col] = pd.to_numeric(df[col], downcast='float') # Converts to float32
         elif col_type == 'object':
             if df[col].nunique() < 50:
                 df[col] = df[col].astype('category')
@@ -91,6 +92,7 @@ def preprocess_data(df):
         'account_age_days', 'day_of_week', 'is_weekend'
     ]
     
+    # Fill remaining NaNs with 0
     df[features] = df[features].fillna(0)
     
     return df, features
@@ -106,10 +108,8 @@ def detect():
         if file.filename == '': return jsonify({"error": "No file selected"}), 400
 
         try:
-            # --- CLOUD SAFETY MODE ---
-            # LIMIT to 15,000 rows to prevent Render Free Tier RAM Crash
-            # This ensures the demo works 100% of the time.
-            df_original = pd.read_csv(file, encoding='utf-8-sig', low_memory=False, nrows=15000)
+            # FIX: Added low_memory=False to prevent DtypeWarning
+            df_original = pd.read_csv(file, encoding='utf-8-sig', low_memory=False)
         except Exception as e:
             return jsonify({"error": f"CSV Error: {str(e)}"}), 400
 
@@ -120,23 +120,27 @@ def detect():
 
         if df.empty: return jsonify({"error": "Empty dataset"}), 400
 
+        # --- MEMORY OPTIMIZATION ---
         scaler = StandardScaler()
+        # Explicitly cast to float32 to save RAM during training
         X_scaled = scaler.fit_transform(df[feature_cols]).astype(np.float32)
         X_scaled = np.nan_to_num(X_scaled)
 
-        # --- MODEL 1: ISOLATION FOREST ---
+        # --- MODEL 1: ISOLATION FOREST (RUNS ON ALL ROWS) ---
         iso = IsolationForest(
             contamination=0.01, 
             n_estimators=100, 
             max_samples='auto', 
-            n_jobs=1, # FORCE SINGLE CORE FOR CLOUD
-            random_state=42
+            n_jobs=1, 
+            random_state=42 # Locked for consistency
         )
         iso.fit(X_scaled)
         
+        # Get Scores for Risk Calculation
         raw_scores = iso.decision_function(X_scaled)
         predictions = iso.predict(X_scaled)
 
+        # --- CALCULATE RISK LEVEL (0, 1, 2, 3) ---
         def get_risk_level(score, pred):
             if pred == 1: return 0 
             if score < -0.025: return 3
@@ -146,17 +150,20 @@ def detect():
         v_get_risk = np.vectorize(get_risk_level)
         risk_levels = v_get_risk(raw_scores, predictions)
 
-        df['anomaly_score'] = risk_levels
+        df['anomaly_score'] = risk_levels # This stores 0, 1, 2, 3
         df['anomaly_label'] = np.where(predictions == -1, 'Anomaly', 'Normal')
 
-        # --- MODEL 2: BENCHMARKS (CLOUD OPTIMIZED) ---
+        # --- MODEL 2: BENCHMARKS (GOD MODE: LOCALHOST EDITION) ---
         benchmarks_data = []
         
-        # Train on a smaller subset for the Live Demo to save speed
-        subset_size = min(len(df), 5000) 
+        # We process UP TO 100,000 rows. If your file is 76k, this means 100% of data.
+        subset_size = min(len(df), 100000) 
         
+        # 🔥 LOCK RANDOM SEED FOR CONSISTENCY
         np.random.seed(42)
+        
         idx = np.random.choice(len(df), subset_size, replace=False)
+        
         y_truth = np.where(predictions[idx] == -1, 1, 0)
         X_bench = X_scaled[idx]
         
@@ -165,11 +172,11 @@ def detect():
                 X_bench, y_truth, test_size=0.3, random_state=42, stratify=y_truth
             )
 
-            # --- LIGHTWEIGHT RANDOM FOREST FOR CLOUD ---
+            # --- 1. RANDOM FOREST (MAX POWER) ---
             rf = RandomForestClassifier(
-                n_estimators=20,       # REDUCED from 200 to 20 for speed
-                max_depth=5,           # REDUCED depth to save RAM
-                n_jobs=1,              # Single core
+                n_estimators=200,      # Massive increase (More trees = Better accuracy)
+                max_depth=None,        # No depth limit. Let it learn everything.
+                n_jobs=-1,             # Use ALL cores of your laptop CPU
                 random_state=42,
                 class_weight='balanced'
             )
@@ -186,9 +193,9 @@ def detect():
             del rf
             gc.collect()
 
-            # --- LIGHTWEIGHT LOGISTIC REGRESSION ---
+            # --- 2. LOGISTIC REGRESSION (MAX CONVERGENCE) ---
             lr = LogisticRegression(
-                max_iter=100,          # REDUCED from 3000 to 100
+                max_iter=3000,          # Force it to keep trying until it's perfect
                 solver='liblinear', 
                 random_state=42,
                 class_weight='balanced'
@@ -227,6 +234,7 @@ def detect():
 
         df['timestamp'] = df['timestamp_dt'].astype(str)
         
+        # Mappings
         country_map = {0: 'DE', 1: 'FR', 2: 'GB', 3: 'PL', 4: 'UA', 5: 'US'}
         df['country'] = df['country'].map(country_map).fillna(df['country'])
         
@@ -242,11 +250,13 @@ def detect():
         success_map = {1: 'Success', 0: 'Failed'}
         df['success'] = df['success'].map(success_map).fillna(df['success'])
 
+        # 🔥 EXPORT LOGIC
         df_export = df.copy()
         
         cols_to_drop = ['timestamp_dt', 'signup_date_dt', 'dt_temp'] 
         df_export.drop(columns=[c for c in cols_to_drop if c in df_export.columns], inplace=True, errors='ignore')
 
+        # Renaming 'anomaly_score' to 'Risk Score' (Space included)
         pretty_names = {
             'user_id': 'User ID', 'anomaly_label': 'Status', 'anomaly_score': 'Risk Score',
             'timestamp': 'Time', 'country': 'Country', 'operation': 'Action',
@@ -256,10 +266,12 @@ def detect():
         }
         df_export.rename(columns=pretty_names, inplace=True)
 
+        # Final Cleanup
         del df
         del X_scaled
         gc.collect()
 
+        # ⏱️ END TIMER
         end_time = time.time()
         duration = round(end_time - start_time, 4)
         
