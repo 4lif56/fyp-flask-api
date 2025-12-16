@@ -265,6 +265,9 @@ def detect():
         
         print(f"⏱️  Speed Test: Processed {summary['total_rows']} rows in {duration} seconds")
 
+        # ✅ CORRECT FIX: Clean 'df_export', not 'df'
+        df_export = df_export.where(pd.notnull(df_export), None)
+            
         return jsonify({
             "summary": summary,
             "benchmarks": benchmarks_data,
