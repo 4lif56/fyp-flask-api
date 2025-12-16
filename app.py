@@ -106,7 +106,7 @@ def detect():
         if file.filename == '': return jsonify({"error": "No file selected"}), 400
 
         try:
-            # ✅ PROCESS EVERYTHING (Unlimited rows, but memory safe)
+            # ✅ Read full file (Safe for 76k rows)
             df_original = pd.read_csv(file, encoding='utf-8-sig', low_memory=False)
         except Exception as e:
             return jsonify({"error": f"CSV Error: {str(e)}"}), 400
@@ -122,12 +122,12 @@ def detect():
         X_scaled = scaler.fit_transform(df[feature_cols]).astype(np.float32)
         X_scaled = np.nan_to_num(X_scaled)
 
-        # --- MODEL 1: ISOLATION FOREST ---
+        # --- MODEL 1: ISOLATION FOREST (TUNED) ---
         iso = IsolationForest(
-            contamination=0.01, 
+            contamination=0.05,   # ⬅️ CHANGED: Look for top 5% anomalies (was 1%)
             n_estimators=100, 
             max_samples='auto', 
-            n_jobs=1, # Single core for cloud stability
+            n_jobs=1, 
             random_state=42
         )
         iso.fit(X_scaled)
@@ -135,10 +135,11 @@ def detect():
         raw_scores = iso.decision_function(X_scaled)
         predictions = iso.predict(X_scaled)
 
+        # Normalize scores to look better on UI
         def get_risk_level(score, pred):
             if pred == 1: return 0 
-            if score < -0.025: return 3
-            if score < -0.008: return 2
+            if score < -0.10: return 3   # ⬅️ Adjusted thresholds
+            if score < -0.05: return 2
             return 1
 
         v_get_risk = np.vectorize(get_risk_level)
@@ -147,11 +148,11 @@ def detect():
         df['anomaly_score'] = risk_levels
         df['anomaly_label'] = np.where(predictions == -1, 'Anomaly', 'Normal')
 
-        # --- MODEL 2: BENCHMARKS (IMPROVED) ---
+        # --- MODEL 2: BENCHMARKS (BOOSTED) ---
         benchmarks_data = []
         
-        # ✅ Increased training size to 10,000 for better accuracy
-        subset_size = min(len(df), 10000) 
+        # ✅ Use 15,000 rows for training (More data = Smarter Model)
+        subset_size = min(len(df), 15000) 
         
         np.random.seed(42)
         idx = np.random.choice(len(df), subset_size, replace=False)
@@ -163,10 +164,10 @@ def detect():
                 X_bench, y_truth, test_size=0.3, random_state=42, stratify=y_truth
             )
 
-            # --- RANDOM FOREST (Slightly smarter) ---
+            # --- RANDOM FOREST (Boosted) ---
             rf = RandomForestClassifier(
-                n_estimators=50,       # ✅ INCREASED from 20 to 50
-                max_depth=8,           # ✅ INCREASED from 5 to 8
+                n_estimators=75,       # ⬅️ INCREASED: More trees
+                max_depth=15,          # ⬅️ INCREASED: Deeper logic
                 n_jobs=1,
                 random_state=42,
                 class_weight='balanced'
@@ -186,7 +187,7 @@ def detect():
 
             # --- LOGISTIC REGRESSION ---
             lr = LogisticRegression(
-                max_iter=100,
+                max_iter=200,          # ⬅️ INCREASED: Let it think longer
                 solver='liblinear', 
                 random_state=42,
                 class_weight='balanced'
@@ -263,26 +264,19 @@ def detect():
         
         print(f"⏱️  Speed Test: Processed {summary['total_rows']} rows in {duration} seconds")
 
-        # Clean NaN values
         df_export = df_export.where(pd.notnull(df_export), None)
 
-        # ✅ SMART SAMPLING FOR TABLE (Max 5000 rows, Mix of Bad & Good)
+        # ✅ SMART SAMPLING (Max 5000 rows, Mix of Bad & Good)
         MAX_ROWS = 5000
-        
-        # 1. Grab ALL anomalies (Priority)
         df_anomalies = df_export[df_export['Status'] == 'Anomaly']
-        
-        # 2. Fill the rest with Normal rows
         remaining_slots = MAX_ROWS - len(df_anomalies)
         
         if remaining_slots > 0:
             df_normal = df_export[df_export['Status'] == 'Normal'].head(remaining_slots)
             df_final = pd.concat([df_anomalies, df_normal])
         else:
-            # If we have massive anomalies, just take the top 5000 riskiest
             df_final = df_anomalies.head(MAX_ROWS)
             
-        # 3. Sort by Risk Score so dangerous stuff is at the top
         results_data = df_final.to_dict(orient="records")
             
         return jsonify({
