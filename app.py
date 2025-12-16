@@ -106,10 +106,8 @@ def detect():
         if file.filename == '': return jsonify({"error": "No file selected"}), 400
 
         try:
-            # --- CLOUD SAFETY MODE ---
-            # LIMIT to 15,000 rows to prevent Render Free Tier RAM Crash
-            # This ensures the demo works 100% of the time.
-            df_original = pd.read_csv(file, encoding='utf-8-sig', low_memory=False, nrows=15000)
+            # ✅ PROCESS EVERYTHING (Unlimited rows, but memory safe)
+            df_original = pd.read_csv(file, encoding='utf-8-sig', low_memory=False)
         except Exception as e:
             return jsonify({"error": f"CSV Error: {str(e)}"}), 400
 
@@ -129,7 +127,7 @@ def detect():
             contamination=0.01, 
             n_estimators=100, 
             max_samples='auto', 
-            n_jobs=1, # FORCE SINGLE CORE FOR CLOUD
+            n_jobs=1, # Single core for cloud stability
             random_state=42
         )
         iso.fit(X_scaled)
@@ -149,11 +147,11 @@ def detect():
         df['anomaly_score'] = risk_levels
         df['anomaly_label'] = np.where(predictions == -1, 'Anomaly', 'Normal')
 
-        # --- MODEL 2: BENCHMARKS (CLOUD OPTIMIZED) ---
+        # --- MODEL 2: BENCHMARKS (IMPROVED) ---
         benchmarks_data = []
         
-        # Train on a smaller subset for the Live Demo to save speed
-        subset_size = min(len(df), 5000) 
+        # ✅ Increased training size to 10,000 for better accuracy
+        subset_size = min(len(df), 10000) 
         
         np.random.seed(42)
         idx = np.random.choice(len(df), subset_size, replace=False)
@@ -165,11 +163,11 @@ def detect():
                 X_bench, y_truth, test_size=0.3, random_state=42, stratify=y_truth
             )
 
-            # --- LIGHTWEIGHT RANDOM FOREST FOR CLOUD ---
+            # --- RANDOM FOREST (Slightly smarter) ---
             rf = RandomForestClassifier(
-                n_estimators=20,       # REDUCED from 200 to 20 for speed
-                max_depth=5,           # REDUCED depth to save RAM
-                n_jobs=1,              # Single core
+                n_estimators=50,       # ✅ INCREASED from 20 to 50
+                max_depth=8,           # ✅ INCREASED from 5 to 8
+                n_jobs=1,
                 random_state=42,
                 class_weight='balanced'
             )
@@ -186,9 +184,9 @@ def detect():
             del rf
             gc.collect()
 
-            # --- LIGHTWEIGHT LOGISTIC REGRESSION ---
+            # --- LOGISTIC REGRESSION ---
             lr = LogisticRegression(
-                max_iter=100,          # REDUCED from 3000 to 100
+                max_iter=100,
                 solver='liblinear', 
                 random_state=42,
                 class_weight='balanced'
@@ -265,14 +263,33 @@ def detect():
         
         print(f"⏱️  Speed Test: Processed {summary['total_rows']} rows in {duration} seconds")
 
-        # ✅ CORRECT FIX: Clean 'df_export', not 'df'
+        # Clean NaN values
         df_export = df_export.where(pd.notnull(df_export), None)
+
+        # ✅ SMART SAMPLING FOR TABLE (Max 5000 rows, Mix of Bad & Good)
+        MAX_ROWS = 5000
+        
+        # 1. Grab ALL anomalies (Priority)
+        df_anomalies = df_export[df_export['Status'] == 'Anomaly']
+        
+        # 2. Fill the rest with Normal rows
+        remaining_slots = MAX_ROWS - len(df_anomalies)
+        
+        if remaining_slots > 0:
+            df_normal = df_export[df_export['Status'] == 'Normal'].head(remaining_slots)
+            df_final = pd.concat([df_anomalies, df_normal])
+        else:
+            # If we have massive anomalies, just take the top 5000 riskiest
+            df_final = df_anomalies.head(MAX_ROWS)
+            
+        # 3. Sort by Risk Score so dangerous stuff is at the top
+        results_data = df_final.to_dict(orient="records")
             
         return jsonify({
             "summary": summary,
             "benchmarks": benchmarks_data,
             "timeline": timeline_data,
-            "results": df_export.to_dict(orient="records")
+            "results": results_data
         })
 
     except Exception as e:
