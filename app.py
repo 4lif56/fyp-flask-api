@@ -106,17 +106,41 @@ def detect():
         if file.filename == '': return jsonify({"error": "No file selected"}), 400
 
         try:
-            # ✅ Read full file (Safe for 76k rows)
+            # ✅ Read full file
             df_original = pd.read_csv(file, encoding='utf-8-sig', low_memory=False)
         except Exception as e:
-            return jsonify({"error": f"CSV Error: {str(e)}"}), 400
+            return jsonify({"error": f"CSV Read Error: The file is corrupted or not a valid CSV."}), 400
+
+        # ==========================================
+        # 🛡️ THE BOUNCER (DATA VALIDATION LAYER)
+        # ==========================================
+        # We check if the file has at least ONE column that looks like cloud data.
+        # If it's a Bingo Scoreboard, it will fail this check.
+        
+        valid_keywords = [
+            'time', 'date', 'timestamp', 'created_at',   # Time stuff
+            'size', 'bytes', 'length', 'storage',        # Size stuff
+            'country', 'region', 'geo', 'location',      # Location stuff
+            'user', 'id', 'client', 'account',           # User stuff
+            'operation', 'action', 'type', 'method'      # Action stuff
+        ]
+        
+        # Check if any column name in the CSV matches our keywords
+        file_columns = [c.lower() for c in df_original.columns]
+        is_valid_file = any(any(k in col for k in valid_keywords) for col in file_columns)
+
+        if not is_valid_file:
+            return jsonify({
+                "error": "❌ Invalid File Format. This does not look like a Cloud Server Log. Please upload a CSV with columns like 'Timestamp', 'File Size', or 'Country'."
+            }), 400
+        # ==========================================
 
         try:
             df, feature_cols = preprocess_data(df_original)
         except Exception as e:
             return jsonify({"error": f"Processing Error: {str(e)}"}), 400
 
-        if df.empty: return jsonify({"error": "Empty dataset"}), 400
+        if df.empty: return jsonify({"error": "Empty dataset after processing"}), 400
 
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(df[feature_cols]).astype(np.float32)
@@ -124,7 +148,7 @@ def detect():
 
         # --- MODEL 1: ISOLATION FOREST (TUNED) ---
         iso = IsolationForest(
-            contamination=0.05,   # ⬅️ CHANGED: Look for top 5% anomalies (was 1%)
+            contamination=0.05, 
             n_estimators=100, 
             max_samples='auto', 
             n_jobs=1, 
@@ -135,10 +159,9 @@ def detect():
         raw_scores = iso.decision_function(X_scaled)
         predictions = iso.predict(X_scaled)
 
-        # Normalize scores to look better on UI
         def get_risk_level(score, pred):
             if pred == 1: return 0 
-            if score < -0.10: return 3   # ⬅️ Adjusted thresholds
+            if score < -0.10: return 3
             if score < -0.05: return 2
             return 1
 
@@ -148,10 +171,8 @@ def detect():
         df['anomaly_score'] = risk_levels
         df['anomaly_label'] = np.where(predictions == -1, 'Anomaly', 'Normal')
 
-        # --- MODEL 2: BENCHMARKS (BOOSTED) ---
+        # --- MODEL 2: BENCHMARKS ---
         benchmarks_data = []
-        
-        # ✅ Use 15,000 rows for training (More data = Smarter Model)
         subset_size = min(len(df), 15000) 
         
         np.random.seed(42)
@@ -164,10 +185,10 @@ def detect():
                 X_bench, y_truth, test_size=0.3, random_state=42, stratify=y_truth
             )
 
-            # --- RANDOM FOREST (Boosted) ---
+            # --- RANDOM FOREST ---
             rf = RandomForestClassifier(
-                n_estimators=75,       # ⬅️ INCREASED: More trees
-                max_depth=15,          # ⬅️ INCREASED: Deeper logic
+                n_estimators=75,
+                max_depth=15,
                 n_jobs=1,
                 random_state=42,
                 class_weight='balanced'
@@ -187,7 +208,7 @@ def detect():
 
             # --- LOGISTIC REGRESSION ---
             lr = LogisticRegression(
-                max_iter=200,          # ⬅️ INCREASED: Let it think longer
+                max_iter=200,
                 solver='liblinear', 
                 random_state=42,
                 class_weight='balanced'
@@ -242,7 +263,6 @@ def detect():
         df['success'] = df['success'].map(success_map).fillna(df['success'])
 
         df_export = df.copy()
-        
         cols_to_drop = ['timestamp_dt', 'signup_date_dt', 'dt_temp'] 
         df_export.drop(columns=[c for c in cols_to_drop if c in df_export.columns], inplace=True, errors='ignore')
 
@@ -261,12 +281,10 @@ def detect():
 
         end_time = time.time()
         duration = round(end_time - start_time, 4)
-        
         print(f"⏱️  Speed Test: Processed {summary['total_rows']} rows in {duration} seconds")
 
         df_export = df_export.where(pd.notnull(df_export), None)
 
-        # ✅ SMART SAMPLING (Max 5000 rows, Mix of Bad & Good)
         MAX_ROWS = 5000
         df_anomalies = df_export[df_export['Status'] == 'Anomaly']
         remaining_slots = MAX_ROWS - len(df_anomalies)
