@@ -1,9 +1,9 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pandas as pd
-from sklearn.ensemble import IsolationForest, RandomForestClassifier
+import joblib  # <--- NEW: For fast loading
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_recall_fscore_support
 import numpy as np
@@ -14,6 +14,21 @@ app = Flask(__name__)
 CORS(app)
 
 app.json.sort_keys = False 
+
+# ==========================================
+# 🚀 LOAD THE "BRAIN" (MODEL) ONCE
+# ==========================================
+print("⏳ Loading pre-trained model...")
+try:
+    # Load the files we created with train_model.py
+    model = joblib.load('model.joblib')
+    scaler = joblib.load('scaler.joblib')
+    print("✅ Model loaded successfully! (Fast Mode)")
+except Exception as e:
+    print(f"❌ Error loading model: {e}")
+    print("⚠️  SYSTEM WARNING: 'model.joblib' not found. Please run 'python train_model.py' locally first!")
+    model = None
+    scaler = None
 
 def preprocess_data(df):
     """ Cleans and prepares the CSV in-place to save memory. """
@@ -100,6 +115,9 @@ def detect():
     # ⏱️ START TIMER
     start_time = time.time()
 
+    if model is None or scaler is None:
+        return jsonify({"error": "Server Error: Model not loaded. Please contact admin."}), 500
+
     try:
         if 'file' not in request.files: return jsonify({"error": "No file uploaded"}), 400
         file = request.files['file']
@@ -114,9 +132,6 @@ def detect():
         # ==========================================
         # 🛡️ THE BOUNCER (DATA VALIDATION LAYER)
         # ==========================================
-        # We check if the file has at least ONE column that looks like cloud data.
-        # If it's a Bingo Scoreboard, it will fail this check.
-        
         valid_keywords = [
             'time', 'date', 'timestamp', 'created_at',   # Time stuff
             'size', 'bytes', 'length', 'storage',        # Size stuff
@@ -125,13 +140,12 @@ def detect():
             'operation', 'action', 'type', 'method'      # Action stuff
         ]
         
-        # Check if any column name in the CSV matches our keywords
         file_columns = [c.lower() for c in df_original.columns]
         is_valid_file = any(any(k in col for k in valid_keywords) for col in file_columns)
 
         if not is_valid_file:
             return jsonify({
-                "error": "❌ Invalid File Format. This does not look like a Cloud Server Log. Please upload a CSV with columns like 'Timestamp', 'File Size', or 'Country'."
+                "error": "❌ Invalid File Format. This does not look like a Cloud Server Log."
             }), 400
         # ==========================================
 
@@ -142,22 +156,15 @@ def detect():
 
         if df.empty: return jsonify({"error": "Empty dataset after processing"}), 400
 
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(df[feature_cols]).astype(np.float32)
+        # --- USE THE PRE-LOADED SCALER ---
+        # Note: We use .transform(), NOT .fit_transform()
+        X_scaled = scaler.transform(df[feature_cols]).astype(np.float32)
         X_scaled = np.nan_to_num(X_scaled)
 
-        # --- MODEL 1: ISOLATION FOREST (TUNED) ---
-        iso = IsolationForest(
-            contamination=0.05, 
-            n_estimators=100, 
-            max_samples='auto', 
-            n_jobs=1, 
-            random_state=42
-        )
-        iso.fit(X_scaled)
-        
-        raw_scores = iso.decision_function(X_scaled)
-        predictions = iso.predict(X_scaled)
+        # --- USE THE PRE-LOADED MODEL ---
+        # Note: We use .predict(), NOT .fit()
+        raw_scores = model.decision_function(X_scaled)
+        predictions = model.predict(X_scaled)
 
         def get_risk_level(score, pred):
             if pred == 1: return 0 
@@ -172,6 +179,7 @@ def detect():
         df['anomaly_label'] = np.where(predictions == -1, 'Anomaly', 'Normal')
 
         # --- MODEL 2: BENCHMARKS ---
+        # (This part stays the same because we still want to show the 'comparison' live)
         benchmarks_data = []
         subset_size = min(len(df), 15000) 
         
