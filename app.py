@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pandas as pd
-import joblib  # <--- NEW: For fast loading
+import joblib  # For fast loading
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
@@ -58,7 +58,7 @@ def preprocess_data(df):
     if cols_to_rename:
         df.rename(columns=cols_to_rename, inplace=True)
 
-    # 2. MEMORY OPTIMIZATION (32-bit Downgrade)
+    # 2. MEMORY OPTIMIZATION
     for col in df.columns:
         col_type = df[col].dtype
         
@@ -130,22 +130,32 @@ def detect():
             return jsonify({"error": f"CSV Read Error: The file is corrupted or not a valid CSV."}), 400
 
         # ==========================================
-        # 🛡️ THE BOUNCER (DATA VALIDATION LAYER)
+        # 🛡️ THE SECURITY BOUNCER (Strict Validation)
         # ==========================================
-        valid_keywords = [
-            'time', 'date', 'timestamp', 'created_at',   # Time stuff
-            'size', 'bytes', 'length', 'storage',        # Size stuff
-            'country', 'region', 'geo', 'location',      # Location stuff
-            'user', 'id', 'client', 'account',           # User stuff
-            'operation', 'action', 'type', 'method'      # Action stuff
-        ]
+        # 1. Normalize Headers (Cleanup)
+        df_original.columns = [c.lower().strip() for c in df_original.columns]
         
-        file_columns = [c.lower() for c in df_original.columns]
-        is_valid_file = any(any(k in col for k in valid_keywords) for col in file_columns)
+        # 2. Define Required SIEM Fields
+        # We check for "Concepts" rather than exact names to be flexible but strict
+        required_concepts = {
+            'User Identity': ['user', 'id', 'client', 'account', 'username'],
+            'Data Size': ['size', 'bytes', 'length', 'storage'],
+            'Timestamp': ['time', 'date', 'timestamp', 'created', 'at']
+        }
 
-        if not is_valid_file:
+        missing_concepts = []
+
+        # 3. Validation Scan
+        for concept, keywords in required_concepts.items():
+            found = any(any(k in col for k in keywords) for col in df_original.columns)
+            if not found:
+                missing_concepts.append(concept)
+
+        # 4. Professional Rejection Message
+        if missing_concepts:
+            missing_str = ", ".join(missing_concepts)
             return jsonify({
-                "error": "❌ Invalid File Format. This does not look like a Cloud Server Log."
+                "error": f"⛔ Schema Validation Failed. The uploaded file does not appear to be a valid Cloud Security Log. Missing critical attributes: {missing_str}. Please use the Standard Audit Template."
             }), 400
         # ==========================================
 
@@ -157,12 +167,10 @@ def detect():
         if df.empty: return jsonify({"error": "Empty dataset after processing"}), 400
 
         # --- USE THE PRE-LOADED SCALER ---
-        # Note: We use .transform(), NOT .fit_transform()
         X_scaled = scaler.transform(df[feature_cols]).astype(np.float32)
         X_scaled = np.nan_to_num(X_scaled)
 
         # --- USE THE PRE-LOADED MODEL ---
-        # Note: We use .predict(), NOT .fit()
         raw_scores = model.decision_function(X_scaled)
         predictions = model.predict(X_scaled)
 
@@ -179,7 +187,6 @@ def detect():
         df['anomaly_label'] = np.where(predictions == -1, 'Anomaly', 'Normal')
 
         # --- MODEL 2: BENCHMARKS ---
-        # (This part stays the same because we still want to show the 'comparison' live)
         benchmarks_data = []
         subset_size = min(len(df), 15000) 
         
