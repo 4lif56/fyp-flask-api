@@ -30,13 +30,12 @@ except Exception as e:
     scaler = None
 
 # ==========================================
-# 🧠 HELPER: EXPLAINABILITY (Why is this an anomaly?)
+# 🧠 HELPER: EXPLAINABILITY
 # ==========================================
 def find_reasons(row, df_stats):
     reasons = []
     
     # 1. Check File Size (if 5x bigger than average)
-    # Note: We check if the value is > 0 to avoid division errors
     if row['file_size'] > 0 and row['file_size'] > (df_stats['avg_size'] * 5):
         reasons.append("Unusual File Size")
     
@@ -59,7 +58,7 @@ def find_reasons(row, df_stats):
     return ", ".join(reasons)
 
 # ==========================================
-# 🛠️ HELPER: DATA PREPROCESSING (Your Robust Version)
+# 🛠️ HELPER: DATA PREPROCESSING
 # ==========================================
 def preprocess_data(df):
     """ Cleans and prepares the CSV in-place to save memory. """
@@ -108,18 +107,15 @@ def preprocess_data(df):
         df['hour'] = df['timestamp_dt'].dt.hour.fillna(0).astype('int8')
 
     if 'success' in df.columns:
-        # Robust check for strings "true", "success", "1"
         df['success'] = df['success'].astype(str).str.lower().isin(['true', '1', 'yes', 'success']).astype('int8')
     else:
         df['success'] = 1
 
-    # Ensure all required numeric features exist
     req_cols = ['file_size', 'storage_limit', 'subscription_type', 'country', 'operation', 'user_id', 'file_type', 'hour']
     for c in req_cols:
         if c not in df.columns:
             df[c] = 0
         else:
-            # Force numeric for the Model
             df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
 
     features = [
@@ -144,23 +140,21 @@ def detect():
         if 'file' not in request.files: return jsonify({"error": "No file uploaded"}), 400
         file = request.files['file']
         
-        # --- 1. GET SENSITIVITY FROM SLIDER (New Feature) ---
-        # 0 = Relaxed, 50 = Normal, 100 = Paranoid
-        user_sensitivity = int(request.form.get('sensitivity', 50))
-        
-        # Math: Map 0-100 to Isolation Forest Threshold (-0.20 to -0.05)
-        # Higher sensitivity = Closer to 0 (Easier to trigger anomaly)
-        base_threshold = -0.13 
-        adjustment = (user_sensitivity - 50) * 0.002 
-        final_threshold = base_threshold + adjustment
+        # --- NEW: GET SENSITIVITY FROM REACT ---
+        # Default to 50 if not sent. Range is 0-100.
+        try:
+            sensitivity = float(request.form.get('sensitivity', 50))
+        except:
+            sensitivity = 50.0
+            
+        if file.filename == '': return jsonify({"error": "No file selected"}), 400
 
         try:
-            # Read CSV
             df_original = pd.read_csv(file, encoding='utf-8-sig', low_memory=False)
         except Exception as e:
-            return jsonify({"error": f"CSV Read Error: Corrupted file."}), 400
+            return jsonify({"error": f"CSV Read Error: The file is corrupted or not a valid CSV."}), 400
 
-        # --- 2. SECURITY BOUNCER (Your Robust Validation) ---
+        # --- SECURITY BOUNCER ---
         df_original.columns = [c.lower().strip() for c in df_original.columns]
         required_concepts = {
             'User Identity': ['user', 'id', 'client', 'account', 'username'],
@@ -173,7 +167,7 @@ def detect():
         if missing:
              return jsonify({"error": f"⛔ Validation Failed. Missing: {', '.join(missing)}"}), 400
 
-        # --- 3. PREPROCESS ---
+        # --- PREPROCESS ---
         try:
             df, feature_cols = preprocess_data(df_original)
         except Exception as e:
@@ -181,63 +175,67 @@ def detect():
 
         if df.empty: return jsonify({"error": "Empty dataset produced."}), 400
 
-        # --- 4. PREDICT & EXPLAIN (New Feature) ---
+        # --- PREDICT ---
         X_scaled = scaler.transform(df[feature_cols]).astype(np.float32)
         X_scaled = np.nan_to_num(X_scaled)
 
-        # Get raw scores
+        # --- DYNAMIC THRESHOLD LOGIC ---
+        # 1. Get raw scores
         raw_scores = model.decision_function(X_scaled)
         
-        # Lists for new columns
-        custom_anomalies = []
-        risks = []
-        reasons_column = []
+        # 2. Convert Slider (0-100) to Contamination %
+        # 0 = 0.1% (Very relaxed), 100 = 10% (Very strict)
+        contamination = 0.001 + (sensitivity / 100) * 0.1 
         
-        # Stats for Reasoning
-        stats = {'avg_size': df['file_size'].mean()}
+        # 3. Calculate Math Threshold
+        threshold = np.percentile(raw_scores, 100 * contamination)
+        
+        # 4. Apply Predictions
+        predictions = np.where(raw_scores < threshold, -1, 1)
 
-        #  - This logic applies the slider threshold
-        for i, score in enumerate(raw_scores):
-            # Use SLIDER threshold instead of default model
-            if score < final_threshold:
-                custom_anomalies.append('Anomaly') 
-                
-                # Risk Logic
-                if score < (final_threshold - 0.10):
-                    risks.append(3) # Critical
-                elif score < (final_threshold - 0.05):
-                    risks.append(2) # High
-                else:
-                    risks.append(1) # Moderate
-                
-                # Call Explainability Helper
+        # 5. Risk Levels
+        critical_threshold = np.percentile(raw_scores, 100 * (contamination * 0.2))
+        
+        def get_risk_level(score, pred):
+            if pred == 1: return 0 
+            if score < critical_threshold: return 3 # Critical
+            if score < threshold: return 2 # High
+            return 1 # Monitor
+
+        v_get_risk = np.vectorize(get_risk_level)
+        risk_levels = v_get_risk(raw_scores, predictions)
+        
+        # Generate Reasons
+        custom_anomalies = np.where(predictions == -1, 'Anomaly', 'Normal')
+        reasons_column = []
+        stats = {'avg_size': df['file_size'].mean()}
+        
+        for i, val in enumerate(custom_anomalies):
+            if val == 'Anomaly':
                 reasons_column.append(find_reasons(df.iloc[i], stats))
             else:
-                custom_anomalies.append('Normal')
-                risks.append(0)
                 reasons_column.append("Normal Activity")
 
-        df['anomaly_score'] = risks
+        df['anomaly_score'] = risk_levels
         df['anomaly_label'] = custom_anomalies
-        df['Analysis'] = reasons_column # The "Why" column
+        df['Analysis'] = reasons_column
 
-        # --- 5. BENCHMARKS (Auto-Tuning Added) ---
+        # --- BENCHMARKS (Auto-Tuning) ---
         benchmarks_data = []
         subset_size = min(len(df), 15000) 
         idx = np.random.choice(len(df), subset_size, replace=False)
         y_truth = np.where(np.array(custom_anomalies)[idx] == 'Anomaly', 1, 0)
         X_bench = X_scaled[idx]
         
+        # Only benchmark if we actually found anomalies
         if len(np.unique(y_truth)) > 1:
             X_train, X_test, y_train, y_test = train_test_split(
                 X_bench, y_truth, test_size=0.3, random_state=42, stratify=y_truth
             )
 
-            # AUTO-TUNING LOOP (New Feature)
+            # Random Forest Auto-Tune
             best_f1 = 0
             best_rf = None
-            
-            # Try different brain sizes
             for n in [50, 100, 150]:
                 rf_cand = RandomForestClassifier(n_estimators=n, random_state=42, class_weight='balanced')
                 rf_cand.fit(X_train, y_train)
@@ -247,7 +245,6 @@ def detect():
                     best_f1 = f1
                     best_rf = rf_cand
             
-            # Final Metrics for Best RF
             rf_pred = best_rf.predict(X_test)
             p, r, f1, _ = precision_recall_fscore_support(y_test, rf_pred, average='binary', zero_division=0)
             
@@ -266,29 +263,16 @@ def detect():
                 "Precision": round(p, 2), "Recall": round(r, 2), "F1": round(f1, 2)
             })
 
-        # --- 6. TIMELINE (Kept from your Robust Code) ---
-        df['dt_temp'] = df['timestamp_dt']
-        timeline_groups = df.groupby([df['dt_temp'].dt.date, 'anomaly_label']).size().unstack(fill_value=0)
-        
-        timeline_data = []
-        for date, row in timeline_groups.iterrows():
-            timeline_data.append({
-                "date": str(date),
-                "Normal": int(row.get('Normal', 0)),
-                "Anomaly": int(row.get('Anomaly', 0))
-            })
-        timeline_data.sort(key=lambda x: x['date'])
-
-        # --- 7. EXPORT PREPARATION (Mapping Back to Strings) ---
+        # --- EXPORT ---
         summary = {
             "total_rows": len(df),
             "anomalies": int((df['anomaly_label'] == 'Anomaly').sum()),
-            "sensitivity_used": user_sensitivity
+            "sensitivity_used": sensitivity
         }
 
         # Recover Readable Strings
         df['timestamp'] = df['timestamp_dt'].astype(str)
-        country_map = {0: 'Other/Unknown', 1: 'FR', 2: 'GB', 3: 'PL', 4: 'UA', 5: 'US'}
+        country_map = {0: 'Other', 1: 'FR', 2: 'GB', 3: 'PL', 4: 'UA', 5: 'US'}
         df['country'] = df['country'].map(country_map).fillna(df['country'])
         
         action_map = {0: 'delete', 1: 'download', 2: 'modify', 3: 'upload'}
@@ -303,6 +287,13 @@ def detect():
         success_map = {1: 'Success', 0: 'Failed'}
         df['success'] = df['success'].map(success_map).fillna(df['success'])
 
+        # Create Timeline Data
+        df['dt_temp'] = df['timestamp_dt']
+        timeline_groups = df.groupby([df['dt_temp'].dt.date, 'anomaly_label']).size().unstack(fill_value=0)
+        timeline_data = [{"date": str(d), "Normal": int(r.get('Normal', 0)), "Anomaly": int(r.get('Anomaly', 0))} for d, r in timeline_groups.iterrows()]
+        timeline_data.sort(key=lambda x: x['date'])
+
+        # Final Cleanup
         df_export = df.copy()
         cols_to_drop = ['timestamp_dt', 'signup_date_dt', 'dt_temp'] 
         df_export.drop(columns=[c for c in cols_to_drop if c in df_export.columns], inplace=True, errors='ignore')
@@ -312,15 +303,13 @@ def detect():
             'timestamp': 'Time', 'country': 'Country', 'operation': 'Action',
             'file_type': 'File Type', 'file_size': 'Size', 'subscription_type': 'Plan',
             'success': 'Success', 'account_age_days': 'Account Age', 
-            'Analysis': 'AI Reasoning' # <-- The new column name
+            'Analysis': 'AI Reasoning'
         }
         df_export.rename(columns=pretty_names, inplace=True)
 
-        # Cleanup
         del df, X_scaled, df_original
         gc.collect()
 
-        # Limit Rows
         MAX_ROWS = 5000
         df_anomalies = df_export[df_export['Status'] == 'Anomaly']
         remaining = MAX_ROWS - len(df_anomalies)
