@@ -275,7 +275,26 @@ def detect():
             benchmarks.append(
                 {"name": "Logistic Regression", "Precision": round(p, 2), "Recall": round(r, 2), "F1": round(f1, 2)}
             )
+        # ==========================
+        # TIMELINE (GRAPH) ✅
+        # ==========================
+        df["date_only"] = df["timestamp_dt"].dt.date
+        timeline_df = (
+            df.groupby(["date_only", "anomaly_label"])
+            .size()
+            .unstack(fill_value=0)
+            .reset_index()
+            .sort_values("date_only")
+        )
 
+        timeline = [
+            {
+                "date": str(row["date_only"]),
+                "Normal": int(row.get("Normal", 0)),
+                "Anomaly": int(row.get("Anomaly", 0)),
+            }
+            for _, row in timeline_df.iterrows()
+        ]
         # ==========================
         # EXPORT
         # ==========================
