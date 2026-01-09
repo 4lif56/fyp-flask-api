@@ -9,6 +9,7 @@ from sklearn.metrics import precision_recall_fscore_support
 import numpy as np
 import gc   # Garbage Collector
 import time 
+from io import BytesIO, StringIO
 
 app = Flask(__name__)
 CORS(app)
@@ -329,6 +330,49 @@ def detect():
     except Exception as e:
         print(f"Error: {e}")
         return jsonify({"error": f"Server Error: {str(e)}"}), 500
+
+@app.route('/template', methods=['GET'])
+def download_template():
+    # 1. Create specific data that WON'T crash the system
+    # We need at least 2 'Normal' and 2 'Anomalies' so Benchmarking works
+    data = {
+        'timestamp': [
+            '2024-01-01 09:00:00', # Normal (Day)
+            '2024-01-01 10:00:00', # Normal (Day)
+            '2024-01-01 03:00:00', # Anomaly (Night)
+            '2024-01-01 03:15:00'  # Anomaly (Night)
+        ],
+        'user_id': ['User123', 'User123', 'HackerX', 'HackerX'],
+        'file_size': [
+            1024,        # Normal Size
+            2048,        # Normal Size
+            999999999,   # Anomaly (Huge)
+            888888888    # Anomaly (Huge)
+        ],
+        'operation': ['upload', 'download', 'delete', 'modify'],
+        'success': ['True', 'True', 'False', 'False'],
+        'country': ['US', 'US', 'Unknown', 'Unknown'],
+        'file_type': ['document', 'photo', 'exe', 'sh'],
+        'subscription_type': ['premium', 'premium', 'free', 'free']
+    }
+
+    # 2. Convert to DataFrame
+    df_template = pd.DataFrame(data)
+
+    # 3. Write to Memory (Cloud-Friendly way, no saving to disk)
+    output = BytesIO()
+    # Write CSV to the buffer
+    df_template.to_csv(output, index=False, encoding='utf-8')
+    output.seek(0)
+
+    # 4. Send as a file download
+    from flask import send_file
+    return send_file(
+        output,
+        mimetype='text/csv',
+        as_attachment=True,
+        download_name='CloudRadar_Template.csv'
+    )
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000)
