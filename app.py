@@ -323,7 +323,7 @@ def detect():
         ]
 
         # ==========================
-        # EXPORT
+        # EXPORT & MAPPING (THE FIX)
         # ==========================
         summary = {
             "total_rows": len(df),
@@ -334,6 +334,25 @@ def detect():
         df["timestamp"] = df["timestamp_dt"].astype(str)
         df.drop(columns=["timestamp_dt", "date_only"], inplace=True, errors="ignore")
 
+        # --- MAPPINGS (Numbers -> Readable Strings) ---
+        # 1. Subscription Type (0=Business, 1=Free, 2=Premium)
+        sub_map = {0: 'Business', 1: 'Free', 2: 'Premium'}
+        df['subscription_type'] = df['subscription_type'].map(sub_map).fillna('Unknown')
+
+        # 2. Operation (0=Upload, 1=Download, 2=Modify, 3=Delete)
+        op_map = {0: 'Upload', 1: 'Download', 2: 'Modify', 3: 'Delete'}
+        df['operation'] = df['operation'].map(op_map).fillna('Other')
+
+        # 3. File Type (1=Document, 2=Photo, 3=Video)
+        type_map = {0: 'Archive', 1: 'Document', 2: 'Photo', 3: 'Video'}
+        df['file_type'] = df['file_type'].map(type_map).fillna('File')
+
+        # 4. Success (1=True, 0=False)
+        success_map = {1: 'True', 0: 'False'}
+        df['success'] = df['success'].map(success_map).fillna('False')
+        
+        # ---------------------------------------------
+
         df_out = df.rename(
             columns={
                 "user_id": "User ID",
@@ -341,8 +360,12 @@ def detect():
                 "anomaly_label": "Status",
                 "anomaly_score": "Risk Score",
                 "file_size": "Size",
-                "storage_limit": "Limit", # <--- Added this for you
+                "storage_limit": "Limit", 
                 "Analysis": "AI Reasoning",
+                "subscription_type": "Plan",
+                "operation": "Action",
+                "file_type": "File Type",
+                "success": "Success"
             }
         )
 
