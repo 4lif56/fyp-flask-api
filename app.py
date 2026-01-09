@@ -43,13 +43,13 @@ def find_reasons(row, df_stats):
 # ==========================================
 def preprocess_data(df):
     """ 
-    Uses Fuzzy Logic to auto-detect column meanings regardless of naming.
+    Creates a fresh, clean dataset by picking the BEST column for each concept.
+    Prevents "Duplicate Column" errors.
     """
-    # 1. CLEAN HEADERS
-    df.columns = [c.lower().strip().replace('_', '').replace(' ', '') for c in df.columns]
+    # 1. Clean Headers
+    df.columns = [str(c).lower().strip().replace('_', '').replace(' ', '') for c in df.columns]
     
-    # 2. DEFINE CONCEPTS & KEYWORDS
-    # We look for these words in the headers to guess what they are.
+    # 2. Define Concepts
     concepts = {
         'timestamp': ['time', 'date', 'created', 'moment', 'clock'],
         'user_id':   ['user', 'client', 'customer', 'account', 'id', 'username', 'login', 'email', 'employee'],
@@ -57,74 +57,78 @@ def preprocess_data(df):
         'success':   ['status', 'success', 'result', 'pass', 'code', 'state'],
         'operation': ['action', 'activity', 'method', 'type', 'event', 'command'],
         'country':   ['geo', 'location', 'region', 'country', 'zone', 'ip'],
-        'file_type': ['format', 'extension', 'mime', 'kind', 'filetype']
+        'file_type': ['format', 'extension', 'mime', 'kind', 'filetype'],
+        'subscription_type': ['plan', 'tier', 'subscription', 'level']
     }
 
-    # 3. SMART MAPPING LOOP
-    # We assign columns based on which concept matches the most keywords.
-    found_cols = set()
-    rename_map = {}
+    # 3. Smart Selection (Pick only ONE best match per concept)
+    df_new = pd.DataFrame()
+    used_cols = set()
 
     for target_name, keywords in concepts.items():
-        best_match = None
+        best_col = None
         best_score = 0
         
         for col in df.columns:
-            if col in found_cols: continue # Already mapped
+            if col in used_cols: continue # Don't use a column twice
             
-            # Scoring: +1 for every keyword found in the column name
+            # Score: +1 per keyword match
             score = sum(1 for k in keywords if k in col)
             
-            # Tie-breaker: prioritization (e.g., 'user_id' is better than just 'id')
+            # Boosters for exact meaning
             if target_name == 'user_id' and 'user' in col: score += 2
             if target_name == 'file_size' and 'byte' in col: score += 2
-
+            
             if score > best_score:
                 best_score = score
-                best_match = col
+                best_col = col
         
-        if best_match and best_score > 0:
-            rename_map[best_match] = target_name
-            found_cols.add(best_match)
+        # If we found a match, copy it to the NEW dataframe
+        if best_col and best_score > 0:
+            df_new[target_name] = df[best_col]
+            used_cols.add(best_col)
 
-    if rename_map:
-        df.rename(columns=rename_map, inplace=True)
-
-    # 4. FEATURE ENGINEERING (Standardize Values)
+    # 4. Fill Missing Columns with Defaults
+    # If a concept wasn't found, create it with default values
     
-    # Time
-    if 'timestamp' not in df.columns: df['timestamp'] = '2024-01-01'
-    df['timestamp_dt'] = pd.to_datetime(df['timestamp'], errors='coerce').fillna(pd.Timestamp('2024-01-01'))
+    # Timestamp
+    if 'timestamp' not in df_new.columns: 
+        df_new['timestamp'] = '2024-01-01'
+    df_new['timestamp_dt'] = pd.to_datetime(df_new['timestamp'], errors='coerce').fillna(pd.Timestamp('2024-01-01'))
     
-    df['hour'] = df['timestamp_dt'].dt.hour.fillna(0).astype('int8')
-    df['day_of_week'] = df['timestamp_dt'].dt.dayofweek.fillna(0).astype('int8')
-    df['is_weekend'] = (df['day_of_week'] >= 5).astype('int8')
+    # Time Features
+    df_new['hour'] = df_new['timestamp_dt'].dt.hour.fillna(0).astype('int8')
+    df_new['day_of_week'] = df_new['timestamp_dt'].dt.dayofweek.fillna(0).astype('int8')
+    df_new['is_weekend'] = (df_new['day_of_week'] >= 5).astype('int8')
 
-    # Account Age
-    df['account_age_days'] = np.random.randint(0, 365, size=len(df)).astype('int16') # Simulation if missing
+    # Account Age (Simulated)
+    df_new['account_age_days'] = np.random.randint(0, 365, size=len(df_new)).astype('int16')
+
+    # User ID Hashing
+    if 'user_id' in df_new.columns:
+        df_new['user_id'] = df_new['user_id'].astype(str).apply(lambda x: abs(hash(x)) % 100000)
+    else:
+        df_new['user_id'] = 0
 
     # Success Boolean
-    if 'success' in df.columns:
-        df['success'] = df['success'].astype(str).str.lower().isin(['true', '1', 'yes', 'success', 'ok', '200']).astype('int8')
+    if 'success' in df_new.columns:
+        df_new['success'] = df_new['success'].astype(str).str.lower().isin(['true', '1', 'yes', 'success', 'ok', '200']).astype('int8')
     else:
-        df['success'] = 1
+        df_new['success'] = 1
 
-    # User ID Hashing (The "Any Name to Number" Logic)
-    # This ensures "JohnDoe", "Client_99", "admin" all become safe numbers for the AI
-    if 'user_id' in df.columns:
-        df['user_id'] = df['user_id'].astype(str).apply(lambda x: abs(hash(x)) % 100000)
-    else:
-        df['user_id'] = 0
+    # Fill Numeric NaNs for remaining fields
+    numeric_cols = ['file_size', 'storage_limit', 'country', 'operation', 'file_type', 'subscription_type']
+    for c in numeric_cols:
+        if c not in df_new.columns: 
+            df_new[c] = 0
+        else: 
+            df_new[c] = pd.to_numeric(df_new[c], errors='coerce').fillna(0)
 
-    # Fill Numeric NaNs
-    for c in ['file_size', 'storage_limit', 'country', 'operation', 'file_type', 'subscription_type']:
-        if c not in df.columns: df[c] = 0
-        else: df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
-
-    # Final Features (Must match Training Order)
+    # 5. Final Output
     features = ['user_id', 'operation', 'file_type', 'file_size', 'success', 'subscription_type', 
                 'storage_limit', 'country', 'hour', 'account_age_days', 'day_of_week', 'is_weekend']
-    return df, features
+    
+    return df_new, features
 
 # ==========================================
 # 🔍 MAIN ROUTE: /DETECT
