@@ -337,6 +337,7 @@ def detect():
             {
                 "summary": summary,
                 "benchmarks": benchmarks,
+                "timeline": timeline,  # <--- THIS WAS MISSING
                 "results": df_out.fillna("").to_dict("records"),
                 "runtime_sec": round(time.time() - start, 2),
             }
