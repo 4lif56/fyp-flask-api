@@ -12,10 +12,15 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_recall_fscore_support
 
+# ==============================
+# HELPER: FORMAT BYTES (Now with TB!)
+# ==============================
 def human_readable_size(bytes_val):
     try:
         bytes_val = float(bytes_val)
-        if bytes_val >= 1024**3:
+        if bytes_val >= 1024**4:
+            return f"{bytes_val / (1024**4):.2f} TB"
+        elif bytes_val >= 1024**3:
             return f"{bytes_val / (1024**3):.2f} GB"
         elif bytes_val >= 1024**2:
             return f"{bytes_val / (1024**2):.2f} MB"
@@ -336,12 +341,17 @@ def detect():
                 "anomaly_label": "Status",
                 "anomaly_score": "Risk Score",
                 "file_size": "Size",
+                "storage_limit": "Limit", # <--- Added this for you
                 "Analysis": "AI Reasoning",
             }
         )
 
+        # Apply formatting to BOTH Size and Limit
         if "Size" in df_out.columns:
             df_out["Size"] = df_out["Size"].apply(human_readable_size)
+        
+        if "Limit" in df_out.columns:
+            df_out["Limit"] = df_out["Limit"].apply(human_readable_size)
 
         anomalies = df_out[df_out["Status"] == "Anomaly"]
         normal = df_out[df_out["Status"] == "Normal"]
@@ -375,7 +385,6 @@ def detect():
 # ==========================================
 @app.route('/template', methods=['GET'])
 def download_template():
-    # 20 Rows: Ensures enough Normal(15) and Anomaly(5) for split
     data = {
         'Timestamp': ['2024-01-01 09:00']*15 + ['2024-01-01 03:00', '2024-01-01 03:15', '2024-01-01 12:00', '2024-01-01 12:05', '2024-01-01 23:59'],
         'User_Identity': ['User']*15 + ['HACKER_X', 'HACKER_X', 'Inside_Job', 'Inside_Job', 'Unknown'],
