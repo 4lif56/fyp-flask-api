@@ -50,10 +50,16 @@ def smart_rename(df):
 # 🧠 HELPER: EXPLAINABILITY
 def find_reasons(row, avg_size):
     reasons = []
-    if row['file_size'] > (avg_size * 5): reasons.append("Unusual File Size")
-    if 3 <= row['hour'] <= 5: reasons.append("Odd Hours (Night)")
-    if row['account_age_days'] < 1: reasons.append("New Account")
-    if row['success'] == 0: reasons.append("Failed Operation")
+    # Safe access using .get() to prevent crashes
+    size = row.get('file_size', 0)
+    hour = row.get('hour', 0)
+    age = row.get('account_age_days', 0)
+    success = row.get('success', 1)
+
+    if size > (avg_size * 5): reasons.append("Unusual File Size")
+    if 3 <= hour <= 5: reasons.append("Odd Hours (Night)")
+    if age < 1: reasons.append("New Account")
+    if success == 0: reasons.append("Failed Operation")
     return ", ".join(reasons) if reasons else "Pattern Deviation"
 
 # 🔍 MAIN ROUTE
@@ -83,15 +89,15 @@ def detect():
         numeric_cols = ['file_size', 'country', 'operation', 'file_type', 'storage_limit', 'subscription_type']
         for c in numeric_cols:
             if c not in df.columns:
-                df[c] = 0 # Create if missing
+                df[c] = 0 # Create column with 0s
             else:
-                df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0) # Clean if exists
+                df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
 
         # Fix Success Column
         if 'success' in df.columns:
             df['success'] = df['success'].astype(str).str.lower().isin(['true', '1', 'yes', 'success']).astype('int8')
         else:
-            df['success'] = 1
+            df['success'] = 1 # Default to success if missing
 
         # User Hash
         df['user_numeric'] = df['user_id'].astype(str).apply(lambda x: abs(hash(x)) % 100000)
@@ -109,11 +115,20 @@ def detect():
         threshold = np.percentile(scores, 100 * contamination)
         preds = np.where(scores < threshold, -1, 1)
 
-        # 3. RESULTS
+        # 3. RESULTS & REASONING (THE FIX IS HERE)
         df['Status'] = np.where(preds == -1, 'Anomaly', 'Normal')
         avg_size = df['file_size'].mean()
-        df['Analysis'] = [find_reasons(row, avg_size) if lbl == 'Anomaly' else "Normal" 
-                          for _, (row, lbl) in enumerate(zip(df.iloc, df['Status']))]
+        
+        # Replaced the broken 'zip' line with a safe loop
+        analysis_list = []
+        # Convert to dictionary for safe iteration
+        records = df.to_dict('records') 
+        for row in records:
+            if row['Status'] == 'Anomaly':
+                analysis_list.append(find_reasons(row, avg_size))
+            else:
+                analysis_list.append("Normal")
+        df['Analysis'] = analysis_list
         
         crit_thresh = np.percentile(scores, 100 * (contamination * 0.2))
         df['Risk Score'] = [3 if s < crit_thresh else 2 if s < threshold else 0 for s in scores]
@@ -138,19 +153,25 @@ def detect():
         
         out_cols = {'user_id': 'User ID', 'timestamp': 'Time', 'file_size': 'Size', 'operation': 'Action'}
         df.rename(columns=out_cols, inplace=True)
-        final_data = pd.concat([df[df['Status']=='Anomaly'], df[df['Status']=='Normal'].head(5000 - len(df[df['Status']=='Anomaly']))])
+        
+        # Sort so anomalies appear first
+        df_anom = df[df['Status']=='Anomaly']
+        df_norm = df[df['Status']=='Normal'].head(5000)
+        final_data = pd.concat([df_anom, df_norm])
         
         del df, X, scores
         gc.collect()
 
         return jsonify({
-            "summary": {"total_rows": len(df_original), "anomalies": int((final_data['Status']=='Anomaly').sum())},
+            "summary": {"total_rows": len(df_original), "anomalies": int(len(df_anom))},
             "benchmarks": benchmarks,
             "timeline": timeline.to_dict(orient='records'),
             "results": final_data.fillna("").to_dict(orient="records")
         })
 
     except Exception as e:
+        import traceback
+        traceback.print_exc() # Prints error to your terminal so you can see it
         return jsonify({"error": f"Server Error: {str(e)}"}), 500
 
 # 📥 DOWNLOAD TEMPLATE
