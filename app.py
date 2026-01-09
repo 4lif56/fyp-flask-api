@@ -11,6 +11,8 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_recall_fscore_support
+import random
+from datetime import datetime, timedelta
 
 # ==============================
 # HELPER: FORMAT BYTES (Now with TB!)
@@ -409,52 +411,65 @@ def detect():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 📥 DOWNLOAD TEMPLATE (Full Features)
+# 📥 DOWNLOAD TEMPLATE (Dynamic: 200+ Rows)
 # ==========================================
 @app.route('/template', methods=['GET'])
 def download_template():
-    data = {
-        'Timestamp': [
-            '2024-01-01 09:00', '2024-01-01 09:15', '2024-01-01 10:00', 
-            '2024-01-01 12:00', '2024-01-01 14:00', '2024-01-01 23:59'
-        ],
-        'User_ID': [
-            'User_101', 'User_101', 'User_202', 
-            'Admin_01', 'HACKER_X', 'Unknown'
-        ],
-        'Action': [
-            'Upload', 'Download', 'Modify', 
-            'Delete', 'Download', 'Delete'
-        ],
-        'File_Type': [
-            'Document', 'Photo', 'Video', 
-            'Archive', 'Document', 'System'
-        ],
-        'Size': [
-            1024, 5242880, 104857600, 
-            2048, 5000000000, 100
-        ],
-        'Country': [
-            'USA', 'USA', 'Germany', 
-            'France', 'China', 'Russia'
-        ],
-        'Plan': [
-            'Premium', 'Premium', 'Free', 
-            'Business', 'Free', 'Free'
-        ],
-        'Storage_Limit': [
-            1099511627776, 1099511627776, 5368709120, 
-            10995116277760, 5368709120, 5368709120
-        ],
-        'Success': [
-            'True', 'True', 'True', 
-            'True', 'True', 'False'
-        ]
-    }
+    # 1. SETUP: Define realistic options for simulation
+    users = ['User_Admin', 'User_Emp_1', 'User_Emp_2', 'User_Emp_3', 'Guest_User', 'Service_Account']
+    actions = ['upload', 'download', 'delete', 'modify', 'login']
+    types = ['document', 'video', 'photo', 'archive', 'code']
+    countries = ['USA', 'UK', 'Germany', 'France', 'China', 'Russia', 'India']
+    plans = ['Business', 'Premium', 'Free']
+    
+    data = []
+    base_time = datetime(2024, 1, 1, 8, 0, 0)
+
+    # 2. GENERATE: Create 200 rows of simulation data
+    for i in range(200):
+        # Time: Slowly moves forward by minutes
+        timestamp = base_time + timedelta(minutes=i*15 + random.randint(0, 10))
+        
+        # User & Behavior logic
+        user = random.choice(users)
+        country = random.choice(countries)
+        
+        # Simulate an "Anomaly" (e.g., Guest from strange country doing large download)
+        if i % 20 == 0:  # Every 20th log is suspicious
+            user = "HACKER_X"
+            country = "North Korea"
+            action = "download"
+            size = random.randint(1024**3, 1024**4) # Huge (1GB - 1TB)
+            success = "False"
+        else:
+            action = random.choice(actions)
+            size = random.randint(1024, 1024**3) # Normal (1KB - 1GB)
+            success = "True"
+
+        row = {
+            'Timestamp': timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            'User_ID': user,
+            'Action': action.capitalize(),
+            'File_Type': random.choice(types).capitalize(),
+            'Size': size,
+            'Country': country,
+            'Plan': random.choice(plans),
+            'Storage_Limit': 1099511627776, # 1 TB
+            'Success': success
+        }
+        data.append(row)
+
+    # 3. EXPORT
     out = BytesIO()
     pd.DataFrame(data).to_csv(out, index=False)
     out.seek(0)
-    return send_file(out, mimetype='text/csv', as_attachment=True, download_name='Smart_Audit_Full_Template.csv')
+    
+    return send_file(
+        out, 
+        mimetype='text/csv', 
+        as_attachment=True, 
+        download_name='Smart_Audit_Simulation.csv'
+    )
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
