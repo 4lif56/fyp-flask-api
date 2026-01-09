@@ -11,6 +11,20 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_recall_fscore_support
 
+def human_readable_size(bytes_val):
+    try:
+        bytes_val = float(bytes_val)
+        if bytes_val >= 1024**3:
+            return f"{bytes_val / (1024**3):.2f} GB"
+        elif bytes_val >= 1024**2:
+            return f"{bytes_val / (1024**2):.2f} MB"
+        elif bytes_val >= 1024:
+            return f"{bytes_val / 1024:.2f} KB"
+        else:
+            return f"{bytes_val:.0f} B"
+    except:
+        return ""
+
 # ==============================
 # CONFIG (Render-safe)
 # ==============================
@@ -280,9 +294,14 @@ def detect():
                 "timestamp": "Time",
                 "anomaly_label": "Status",
                 "anomaly_score": "Risk Score",
+                "file_size": "Size",
                 "Analysis": "AI Reasoning",
             }
         )
+
+
+        if "Size" in df_out.columns:
+            df_out["Size"] = df_out["Size"].apply(human_readable_size)
 
         anomalies = df_out[df_out["Status"] == "Anomaly"]
         normal = df_out[df_out["Status"] == "Normal"]
