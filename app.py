@@ -240,7 +240,7 @@ def detect():
         ]
 
         # ==========================
-        # BENCHMARKING (SAFE)
+        # BENCHMARKING
         # ==========================
         benchmarks = []
         subset = min(len(df), MAX_BENCH_ROWS)
@@ -251,7 +251,6 @@ def detect():
         y = (df_sample["anomaly_label"] == "Anomaly").astype(int)
 
         unique_y, counts = np.unique(y, return_counts=True)
-        # Safe split: Needs at least 2 classes and 2 items per class
         if len(unique_y) > 1 and np.min(counts) >= 2:
             Xtr, Xte, ytr, yte = train_test_split(
                 Xb, y, test_size=0.3, stratify=y, random_state=42
@@ -262,149 +261,117 @@ def detect():
         if Xtr is not None:
             rf_best, best_f1 = None, 0
             for n in (50, 100, 150):
-                rf = RandomForestClassifier(
-                    n_estimators=n, random_state=42, class_weight="balanced"
-                )
+                rf = RandomForestClassifier(n_estimators=n, random_state=42, class_weight="balanced")
                 rf.fit(Xtr, ytr)
-                _, _, f1, _ = precision_recall_fscore_support(
-                    yte, rf.predict(Xte), average="binary", zero_division=0
-                )
-                if f1 >= best_f1:
-                    best_f1, rf_best = f1, rf
+                _, _, f1, _ = precision_recall_fscore_support(yte, rf.predict(Xte), average="binary", zero_division=0)
+                if f1 >= best_f1: best_f1, rf_best = f1, rf
 
-            p, r, f1, _ = precision_recall_fscore_support(
-                yte, rf_best.predict(Xte), average="binary", zero_division=0
-            )
-            benchmarks.append(
-                {
-                    "name": f"Random Forest (n={rf_best.n_estimators})",
-                    "Precision": round(p, 2),
-                    "Recall": round(r, 2),
-                    "F1": round(f1, 2),
-                }
-            )
+            p, r, f1, _ = precision_recall_fscore_support(yte, rf_best.predict(Xte), average="binary", zero_division=0)
+            benchmarks.append({"name": f"Random Forest (n={rf_best.n_estimators})", "Precision": round(p, 2), "Recall": round(r, 2), "F1": round(f1, 2)})
 
             lr = LogisticRegression(max_iter=200, solver="liblinear", class_weight="balanced")
             lr.fit(Xtr, ytr)
-            p, r, f1, _ = precision_recall_fscore_support(
-                yte, lr.predict(Xte), average="binary", zero_division=0
-            )
-            benchmarks.append(
-                {"name": "Logistic Regression", "Precision": round(p, 2), "Recall": round(r, 2), "F1": round(f1, 2)}
-            )
+            p, r, f1, _ = precision_recall_fscore_support(yte, lr.predict(Xte), average="binary", zero_division=0)
+            benchmarks.append({"name": "Logistic Regression", "Precision": round(p, 2), "Recall": round(r, 2), "F1": round(f1, 2)})
 
         # ==========================
-        # TIMELINE (FIXED: CONTINUOUS DATES)
+        # TIMELINE
         # ==========================
         df["date_only"] = df["timestamp_dt"].dt.floor("D")
-
-        timeline_df = (
-            df.groupby(["date_only", "anomaly_label"])
-            .size()
-            .unstack(fill_value=0)
-        )
-
+        timeline_df = df.groupby(["date_only", "anomaly_label"]).size().unstack(fill_value=0)
+        
         if not timeline_df.empty:
-            full_range = pd.date_range(
-                start=timeline_df.index.min(), 
-                end=timeline_df.index.max(), 
-                freq="D"
-            )
+            full_range = pd.date_range(start=timeline_df.index.min(), end=timeline_df.index.max(), freq="D")
             timeline_df = timeline_df.reindex(full_range, fill_value=0)
             timeline_df.index.name = "date_only"
 
-        timeline = [
-            {
-                "date": date_val.strftime("%Y-%m-%d"),
-                "Normal": int(row.get("Normal", 0)),
-                "Anomaly": int(row.get("Anomaly", 0)),
-            }
-            for date_val, row in timeline_df.iterrows()
-        ]
+        timeline = [{"date": d.strftime("%Y-%m-%d"), "Normal": int(r.get("Normal", 0)), "Anomaly": int(r.get("Anomaly", 0))} for d, r in timeline_df.iterrows()]
 
         # ==========================
-        # EXPORT & MAPPING (THE FIX)
+        # MAPPINGS & EXPORT (THE FIX)
         # ==========================
-        summary = {
-            "total_rows": len(df),
-            "anomalies": int((df["anomaly_label"] == "Anomaly").sum()),
-            "sensitivity_used": sensitivity,
-        }
+        summary = {"total_rows": len(df), "anomalies": int((df["anomaly_label"] == "Anomaly").sum()), "sensitivity_used": sensitivity}
 
         df["timestamp"] = df["timestamp_dt"].astype(str)
         df.drop(columns=["timestamp_dt", "date_only"], inplace=True, errors="ignore")
 
-        # --- MAPPINGS (Numbers -> Readable Strings) ---
-        # 1. Subscription Type (0=Business, 1=Free, 2=Premium)
+        # 1. FIX COUNTRY (5 -> USA)
+        country_map = {0: 'Germany', 1: 'France', 2: 'UK', 3: 'Poland', 4: 'Ukraine', 5: 'USA'}
+        df['country'] = df['country'].map(country_map).fillna(df['country'])
+
+        # 2. FIX WEEKEND / DAY
+        df['is_weekend'] = df['is_weekend'].map({0: 'No', 1: 'Yes'})
+        day_map = {0: 'Monday', 1: 'Tuesday', 2: 'Wednesday', 3: 'Thursday', 4: 'Friday', 5: 'Saturday', 6: 'Sunday'}
+        df['day_of_week'] = df['day_of_week'].map(day_map)
+
+        # 3. FIX OTHER CODES
         sub_map = {0: 'Business', 1: 'Free', 2: 'Premium'}
         df['subscription_type'] = df['subscription_type'].map(sub_map).fillna('Unknown')
 
-        # 2. Operation (0=Upload, 1=Download, 2=Modify, 3=Delete)
         op_map = {0: 'Upload', 1: 'Download', 2: 'Modify', 3: 'Delete'}
         df['operation'] = df['operation'].map(op_map).fillna('Other')
 
-        # 3. File Type (1=Document, 2=Photo, 3=Video)
         type_map = {0: 'Archive', 1: 'Document', 2: 'Photo', 3: 'Video'}
         df['file_type'] = df['file_type'].map(type_map).fillna('File')
 
-        # 4. Success (1=True, 0=False)
         success_map = {1: 'True', 0: 'False'}
         df['success'] = df['success'].map(success_map).fillna('False')
-        
-        # ---------------------------------------------
 
-        df_out = df.rename(
-            columns={
-                "user_id": "User ID",
-                "timestamp": "Time",
-                "anomaly_label": "Status",
-                "anomaly_score": "Risk Score",
-                "file_size": "Size",
-                "storage_limit": "Limit", 
-                "Analysis": "AI Reasoning",
-                "subscription_type": "Plan",
-                "operation": "Action",
-                "file_type": "File Type",
-                "success": "Success"
-            }
-        )
+        # 4. RENAME FOR MAIN TABLE
+        df_out = df.rename(columns={
+            "user_id": "User ID",
+            "anomaly_label": "Status",
+            "anomaly_score": "Risk Score",
+            "timestamp": "Time",
+            "operation": "Action",
+            "file_size": "Size",
+            "country": "Country", # <--- Main Table Column
+            # Extra data for click
+            "storage_limit": "Limit", 
+            "Analysis": "AI Reasoning",
+            "subscription_type": "Plan",
+            "file_type": "File Type",
+            "success": "Success",
+            "day_of_week": "Day",
+            "is_weekend": "Weekend"
+        })
 
-        # Apply formatting to BOTH Size and Limit
-        if "Size" in df_out.columns:
-            df_out["Size"] = df_out["Size"].apply(human_readable_size)
-        
-        if "Limit" in df_out.columns:
-            df_out["Limit"] = df_out["Limit"].apply(human_readable_size)
+        # 5. FORMAT BYTES
+        for col in ["Size", "Limit"]:
+            if col in df_out.columns:
+                df_out[col] = df_out[col].apply(human_readable_size)
+
+        # 6. REORDER COLUMNS (Ensure Main Table keys are first)
+        main_cols = ["User ID", "Status", "Risk Score", "Time", "Action", "Size", "Country"]
+        remaining_cols = [c for c in df_out.columns if c not in main_cols]
+        df_out = df_out[main_cols + remaining_cols]
 
         anomalies = df_out[df_out["Status"] == "Anomaly"]
         normal = df_out[df_out["Status"] == "Normal"]
 
         if len(anomalies) < MAX_OUTPUT_ROWS:
-            df_out = pd.concat([anomalies, normal.head(MAX_OUTPUT_ROWS - len(anomalies))])
+            final_df = pd.concat([anomalies, normal.head(MAX_OUTPUT_ROWS - len(anomalies))])
         else:
-            df_out = anomalies.head(MAX_OUTPUT_ROWS)
+            final_df = anomalies.head(MAX_OUTPUT_ROWS)
 
         del df, df_raw, X
         gc.collect()
 
-        return jsonify(
-            {
-                "summary": summary,
-                "benchmarks": benchmarks,
-                "timeline": timeline,
-                "results": df_out.fillna("").to_dict("records"),
-                "runtime_sec": round(time.time() - start, 2),
-            }
-        )
+        return jsonify({
+            "summary": summary,
+            "benchmarks": benchmarks,
+            "timeline": timeline,
+            "results": final_df.fillna("").to_dict("records"),
+            "runtime_sec": round(time.time() - start, 2)
+        })
 
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-
 # ==========================================
-# 📥 DOWNLOAD TEMPLATE (Fixed: 20 Rows)
+# 📥 DOWNLOAD TEMPLATE
 # ==========================================
 @app.route('/template', methods=['GET'])
 def download_template():
