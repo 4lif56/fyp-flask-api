@@ -80,7 +80,7 @@ def find_reasons(row, stats):
     return ", ".join(reasons) if reasons else "Pattern Deviation"
 
 # ==============================
-# PREPROCESSING (FUZZY MATCHING)
+# PREPROCESSING (SMART: Tracks Valid Cols)
 # ==============================
 def preprocess_data(df):
     rename_map = {
@@ -108,11 +108,18 @@ def preprocess_data(df):
     if rename:
         df.rename(columns=rename, inplace=True)
 
+    # TRACK VALID COLUMNS (What did the user actually provide?)
+    valid_cols = set(df.columns)
+
     # Timestamp
     if "timestamp" in df.columns:
         df["timestamp_dt"] = pd.to_datetime(df["timestamp"], errors="coerce").fillna(
             pd.Timestamp("2024-01-01")
         )
+        # If timestamp is valid, derived features are valid
+        valid_cols.add("hour")
+        valid_cols.add("day_of_week")
+        valid_cols.add("is_weekend")
     else:
         df["timestamp_dt"] = pd.Timestamp("2024-01-01")
 
@@ -124,6 +131,7 @@ def preprocess_data(df):
         df["account_age_days"] = (
             df["timestamp_dt"] - signup_dt
         ).dt.days.fillna(0).astype("int16")
+        valid_cols.add("account_age_days")
     else:
         df["account_age_days"] = np.random.randint(0, 365, size=len(df))
 
@@ -155,7 +163,11 @@ def preprocess_data(df):
 
     for col in required:
         if col not in df.columns:
-            df[col] = 0
+            df[col] = 0  # Impute 0 for model stability
+        else:
+            valid_cols.add(col) # Ensure it's marked as valid if present
+
+    for col in required:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
     features = [
@@ -173,7 +185,7 @@ def preprocess_data(df):
         "is_weekend",
     ]
 
-    return df, features
+    return df, features, valid_cols
 
 # ==============================
 # MAIN ROUTE
@@ -193,12 +205,13 @@ def detect():
         df_raw = pd.read_csv(request.files["file"], encoding="utf-8-sig", low_memory=False)
         df_raw.columns = [c.lower().strip() for c in df_raw.columns]
 
-        # Security validation
+        # Security validation (Minimal check)
+        # If user only has ID/Date/Country, that's fine.
         concepts = {
             "User Identity": ["user", "id", "account"],
-            "Data Size": ["size", "bytes", "storage"],
             "Timestamp": ["time", "date"],
         }
+        # Note: I removed Size/Storage from mandatory concepts to allow minimal CSVs
 
         missing = [
             name
@@ -209,7 +222,8 @@ def detect():
         if missing:
             return jsonify({"error": f"Missing: {', '.join(missing)}"}), 400
 
-        df, feature_cols = preprocess_data(df_raw)
+        # Receive valid_cols to know what to hide later
+        df, feature_cols, valid_cols = preprocess_data(df_raw)
 
         X = scaler.transform(df[feature_cols]).astype(np.float32)
         X = np.nan_to_num(X)
@@ -288,23 +302,21 @@ def detect():
         timeline = [{"date": d.strftime("%Y-%m-%d"), "Normal": int(r.get("Normal", 0)), "Anomaly": int(r.get("Anomaly", 0))} for d, r in timeline_df.iterrows()]
 
         # ==========================
-        # MAPPINGS & EXPORT (THE FIX)
+        # MAPPINGS & DYNAMIC EXPORT
         # ==========================
         summary = {"total_rows": len(df), "anomalies": int((df["anomaly_label"] == "Anomaly").sum()), "sensitivity_used": sensitivity}
 
         df["timestamp"] = df["timestamp_dt"].astype(str)
         df.drop(columns=["timestamp_dt", "date_only"], inplace=True, errors="ignore")
 
-        # 1. FIX COUNTRY (5 -> USA)
+        # 1. APPLY MAPPINGS (Standardize Values)
         country_map = {0: 'Germany', 1: 'France', 2: 'UK', 3: 'Poland', 4: 'Ukraine', 5: 'USA'}
         df['country'] = df['country'].map(country_map).fillna(df['country'])
 
-        # 2. FIX WEEKEND / DAY
         df['is_weekend'] = df['is_weekend'].map({0: 'No', 1: 'Yes'})
         day_map = {0: 'Monday', 1: 'Tuesday', 2: 'Wednesday', 3: 'Thursday', 4: 'Friday', 5: 'Saturday', 6: 'Sunday'}
         df['day_of_week'] = df['day_of_week'].map(day_map)
 
-        # 3. FIX OTHER CODES
         sub_map = {0: 'Business', 1: 'Free', 2: 'Premium'}
         df['subscription_type'] = df['subscription_type'].map(sub_map).fillna('Unknown')
 
@@ -317,7 +329,7 @@ def detect():
         success_map = {1: 'True', 0: 'False'}
         df['success'] = df['success'].map(success_map).fillna('False')
 
-        # 4. RENAME FOR MAIN TABLE
+        # 2. RENAME TO DISPLAY NAMES
         df_out = df.rename(columns={
             "user_id": "User ID",
             "anomaly_label": "Status",
@@ -325,8 +337,7 @@ def detect():
             "timestamp": "Time",
             "operation": "Action",
             "file_size": "Size",
-            "country": "Country", # <--- Main Table Column
-            # Extra data for click
+            "country": "Country", 
             "storage_limit": "Limit", 
             "Analysis": "AI Reasoning",
             "subscription_type": "Plan",
@@ -336,15 +347,42 @@ def detect():
             "is_weekend": "Weekend"
         })
 
-        # 5. FORMAT BYTES
+        # 3. FORMAT BYTES
         for col in ["Size", "Limit"]:
             if col in df_out.columns:
                 df_out[col] = df_out[col].apply(human_readable_size)
 
-        # 6. REORDER COLUMNS (Ensure Main Table keys are first)
-        main_cols = ["User ID", "Status", "Risk Score", "Time", "Action", "Size", "Country"]
-        remaining_cols = [c for c in df_out.columns if c not in main_cols]
-        df_out = df_out[main_cols + remaining_cols]
+        # 4. DYNAMIC FILTERING (Hide columns that weren't in input)
+        # Map: Display Name -> Internal Name
+        # If Internal Name is NOT in valid_cols, we DROP it.
+        display_map = {
+            "Action": "operation",
+            "Size": "file_size",
+            "Country": "country",
+            "Limit": "storage_limit",
+            "Plan": "subscription_type",
+            "File Type": "file_type",
+            "Success": "success",
+            "Day": "day_of_week",
+            "Weekend": "is_weekend"
+        }
+
+        # Mandatory columns that MUST show if AI runs
+        final_cols = ["User ID", "Status", "Risk Score", "Time", "AI Reasoning"]
+        
+        # Add dynamic columns only if valid
+        for display_name, internal_name in display_map.items():
+            if internal_name in valid_cols:
+                final_cols.append(display_name)
+
+        # Ensure we only select columns that exist in df_out
+        final_cols = [c for c in final_cols if c in df_out.columns]
+        
+        # Reorder specifically for Main Table Priority (User ID, Status, Risk, Time, [Action, Size, Country...])
+        preferred_order = ["User ID", "Status", "Risk Score", "Time", "Action", "Size", "Country"]
+        ordered_cols = [c for c in preferred_order if c in final_cols] + [c for c in final_cols if c not in preferred_order]
+        
+        df_out = df_out[ordered_cols]
 
         anomalies = df_out[df_out["Status"] == "Anomaly"]
         normal = df_out[df_out["Status"] == "Normal"]
@@ -371,21 +409,52 @@ def detect():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 📥 DOWNLOAD TEMPLATE
+# 📥 DOWNLOAD TEMPLATE (Full Features)
 # ==========================================
 @app.route('/template', methods=['GET'])
 def download_template():
     data = {
-        'Timestamp': ['2024-01-01 09:00']*15 + ['2024-01-01 03:00', '2024-01-01 03:15', '2024-01-01 12:00', '2024-01-01 12:05', '2024-01-01 23:59'],
-        'User_Identity': ['User']*15 + ['HACKER_X', 'HACKER_X', 'Inside_Job', 'Inside_Job', 'Unknown'],
-        'File_Size_Bytes': [1024]*15 + [100, 100, 999999999, 999999999, 500],
-        'Activity_Type': ['upload']*15 + ['download', 'delete', 'download', 'download', 'login'],
-        'Is_Success': ['True']*15 + ['True', 'False', 'True', 'True', 'False']
+        'Timestamp': [
+            '2024-01-01 09:00', '2024-01-01 09:15', '2024-01-01 10:00', 
+            '2024-01-01 12:00', '2024-01-01 14:00', '2024-01-01 23:59'
+        ],
+        'User_ID': [
+            'User_101', 'User_101', 'User_202', 
+            'Admin_01', 'HACKER_X', 'Unknown'
+        ],
+        'Action': [
+            'Upload', 'Download', 'Modify', 
+            'Delete', 'Download', 'Delete'
+        ],
+        'File_Type': [
+            'Document', 'Photo', 'Video', 
+            'Archive', 'Document', 'System'
+        ],
+        'Size': [
+            1024, 5242880, 104857600, 
+            2048, 5000000000, 100
+        ],
+        'Country': [
+            'USA', 'USA', 'Germany', 
+            'France', 'China', 'Russia'
+        ],
+        'Plan': [
+            'Premium', 'Premium', 'Free', 
+            'Business', 'Free', 'Free'
+        ],
+        'Storage_Limit': [
+            1099511627776, 1099511627776, 5368709120, 
+            10995116277760, 5368709120, 5368709120
+        ],
+        'Success': [
+            'True', 'True', 'True', 
+            'True', 'True', 'False'
+        ]
     }
     out = BytesIO()
     pd.DataFrame(data).to_csv(out, index=False)
     out.seek(0)
-    return send_file(out, mimetype='text/csv', as_attachment=True, download_name='Smart_Audit_Template.csv')
+    return send_file(out, mimetype='text/csv', as_attachment=True, download_name='Smart_Audit_Full_Template.csv')
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
