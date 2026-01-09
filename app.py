@@ -1,10 +1,11 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import pandas as pd
 import joblib
 import numpy as np
 import gc
 import time
+from io import BytesIO
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -53,17 +54,22 @@ except Exception as e:
 # ==============================
 def find_reasons(row, stats):
     reasons = []
+    # Use .get() for safety
+    val_size = row.get("file_size", 0)
+    val_hour = row.get("hour", 0)
+    val_age = row.get("account_age_days", 0)
+    val_success = row.get("success", 1)
 
-    if row["file_size"] > 0 and row["file_size"] > stats["avg_size"] * 5:
+    if val_size > 0 and val_size > stats["avg_size"] * 5:
         reasons.append("Unusual File Size")
 
-    if 3 <= row["hour"] <= 5:
+    if 3 <= val_hour <= 5:
         reasons.append("Odd Hours (Night)")
 
-    if row["account_age_days"] < 1:
+    if val_age < 1:
         reasons.append("New Account")
 
-    if row["success"] == 0:
+    if val_success == 0:
         reasons.append("Failed Operation")
 
     return ", ".join(reasons) if reasons else "Pattern Deviation"
@@ -229,53 +235,31 @@ def detect():
         ]
 
         # ==========================
-        # BENCHMARKING (SAFE, FULL-FEATURE)
+        # BENCHMARKING (SAFE)
         # ==========================
         benchmarks = []
-
-        # Take a random subset for benchmarking
         subset = min(len(df), MAX_BENCH_ROWS)
         idx = np.random.choice(len(df), subset, replace=False)
-
+        
         df_sample = df.iloc[idx].copy()
-        Xb = X[idx]  # All features included
+        Xb = X[idx]
         y = (df_sample["anomaly_label"] == "Anomaly").astype(int)
 
-        # Check if we have enough samples per class
-        counts = np.bincount(y)
-
-        if len(np.unique(y)) > 1 and counts.min() >= 2:
-            # Safe to split with stratify
+        unique_y, counts = np.unique(y, return_counts=True)
+        # Safe split: Needs at least 2 classes and 2 items per class
+        if len(unique_y) > 1 and np.min(counts) >= 2:
             Xtr, Xte, ytr, yte = train_test_split(
                 Xb, y, test_size=0.3, stratify=y, random_state=42
             )
         else:
-            # Small dataset / too few anomalies → oversample minority class just for benchmark
-            anomalies = df_sample[df_sample["anomaly_label"] == "Anomaly"]
-            normal = df_sample[df_sample["anomaly_label"] == "Normal"]
+            Xtr = None
 
-            # Ensure at least 2 anomalies
-            if len(anomalies) == 1:
-                anomalies = pd.concat([anomalies, anomalies], ignore_index=True)
-            elif len(anomalies) == 0:
-                # Edge case: no anomalies in sample, skip benchmark
-                print("⚠️ Skipping benchmark: no anomalies present")
-                Xtr, Xte, ytr, yte = None, None, None, None
-
-            df_sample = pd.concat([normal, anomalies], ignore_index=True)
-            if Xtr is None:
-                Xb = scaler.transform(df_sample[feature_cols])
-                y = (df_sample["anomaly_label"] == "Anomaly").astype(int)
-                Xtr, Xte, ytr, yte = train_test_split(
-                    Xb, y, test_size=0.3, random_state=42
-                )
-
-        # Only run benchmark if we have a valid split
         if Xtr is not None:
-            # Random Forest Benchmark
             rf_best, best_f1 = None, 0
             for n in (50, 100, 150):
-                rf = RandomForestClassifier(n_estimators=n, random_state=42, class_weight="balanced")
+                rf = RandomForestClassifier(
+                    n_estimators=n, random_state=42, class_weight="balanced"
+                )
                 rf.fit(Xtr, ytr)
                 _, _, f1, _ = precision_recall_fscore_support(
                     yte, rf.predict(Xte), average="binary", zero_division=0
@@ -295,7 +279,6 @@ def detect():
                 }
             )
 
-            # Logistic Regression Benchmark
             lr = LogisticRegression(max_iter=200, solver="liblinear", class_weight="balanced")
             lr.fit(Xtr, ytr)
             p, r, f1, _ = precision_recall_fscore_support(
@@ -304,26 +287,36 @@ def detect():
             benchmarks.append(
                 {"name": "Logistic Regression", "Precision": round(p, 2), "Recall": round(r, 2), "F1": round(f1, 2)}
             )
+
         # ==========================
-        # TIMELINE (GRAPH) ✅
+        # TIMELINE (FIXED: CONTINUOUS DATES)
         # ==========================
-        df["date_only"] = df["timestamp_dt"].dt.date
+        df["date_only"] = df["timestamp_dt"].dt.floor("D")
+
         timeline_df = (
             df.groupby(["date_only", "anomaly_label"])
             .size()
             .unstack(fill_value=0)
-            .reset_index()
-            .sort_values("date_only")
         )
+
+        if not timeline_df.empty:
+            full_range = pd.date_range(
+                start=timeline_df.index.min(), 
+                end=timeline_df.index.max(), 
+                freq="D"
+            )
+            timeline_df = timeline_df.reindex(full_range, fill_value=0)
+            timeline_df.index.name = "date_only"
 
         timeline = [
             {
-                "date": str(row["date_only"]),
+                "date": date_val.strftime("%Y-%m-%d"),
                 "Normal": int(row.get("Normal", 0)),
                 "Anomaly": int(row.get("Anomaly", 0)),
             }
-            for _, row in timeline_df.iterrows()
+            for date_val, row in timeline_df.iterrows()
         ]
+
         # ==========================
         # EXPORT
         # ==========================
@@ -334,7 +327,7 @@ def detect():
         }
 
         df["timestamp"] = df["timestamp_dt"].astype(str)
-        df.drop(columns=["timestamp_dt"], inplace=True, errors="ignore")
+        df.drop(columns=["timestamp_dt", "date_only"], inplace=True, errors="ignore")
 
         df_out = df.rename(
             columns={
@@ -346,7 +339,6 @@ def detect():
                 "Analysis": "AI Reasoning",
             }
         )
-
 
         if "Size" in df_out.columns:
             df_out["Size"] = df_out["Size"].apply(human_readable_size)
@@ -366,16 +358,35 @@ def detect():
             {
                 "summary": summary,
                 "benchmarks": benchmarks,
-                "timeline": timeline,  # <--- THIS WAS MISSING
+                "timeline": timeline,
                 "results": df_out.fillna("").to_dict("records"),
                 "runtime_sec": round(time.time() - start, 2),
             }
         )
 
     except Exception as e:
-        print("ERROR:", e)
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+
+# ==========================================
+# 📥 DOWNLOAD TEMPLATE (Fixed: 20 Rows)
+# ==========================================
+@app.route('/template', methods=['GET'])
+def download_template():
+    # 20 Rows: Ensures enough Normal(15) and Anomaly(5) for split
+    data = {
+        'Timestamp': ['2024-01-01 09:00']*15 + ['2024-01-01 03:00', '2024-01-01 03:15', '2024-01-01 12:00', '2024-01-01 12:05', '2024-01-01 23:59'],
+        'User_Identity': ['User']*15 + ['HACKER_X', 'HACKER_X', 'Inside_Job', 'Inside_Job', 'Unknown'],
+        'File_Size_Bytes': [1024]*15 + [100, 100, 999999999, 999999999, 500],
+        'Activity_Type': ['upload']*15 + ['download', 'delete', 'download', 'download', 'login'],
+        'Is_Success': ['True']*15 + ['True', 'False', 'True', 'True', 'False']
+    }
+    out = BytesIO()
+    pd.DataFrame(data).to_csv(out, index=False)
+    out.seek(0)
+    return send_file(out, mimetype='text/csv', as_attachment=True, download_name='Smart_Audit_Template.csv')
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
