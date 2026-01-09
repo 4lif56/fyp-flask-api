@@ -80,13 +80,21 @@ def preprocess_data(df):
         df['success'] = df['success'].astype(str).str.lower().isin(['true', '1', 'yes', 'success']).astype('int8')
     else:
         df['success'] = 1
+    
+    # --- FIX: HASH USER ID (TEXT -> NUMBER) ---
+    # The AI model crashes on text like "User_Admin". We convert it to a number.
+    if 'user_id' in df.columns:
+        df['user_id_num'] = df['user_id'].astype(str).apply(lambda x: abs(hash(x)) % 100000)
+    else:
+        df['user_id_num'] = 0
 
     # Fill Numeric NaNs
     for c in ['file_size', 'storage_limit', 'country', 'operation', 'file_type']:
         if c not in df.columns: df[c] = 0
         else: df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
 
-    features = ['user_id', 'operation', 'file_type', 'file_size', 'success', 'subscription_type', 
+    # Note: We use 'user_id_num' instead of 'user_id' for the AI
+    features = ['user_id_num', 'operation', 'file_type', 'file_size', 'success', 'subscription_type', 
                 'storage_limit', 'country', 'hour', 'account_age_days', 'day_of_week', 'is_weekend']
     return df, features
 
@@ -117,6 +125,7 @@ def detect():
         if df.empty: return jsonify({"error": "Empty dataset produced."}), 400
 
         # --- PREDICT ---
+        # Ensure we only pass numeric columns to the AI
         X_scaled = np.nan_to_num(scaler.transform(df[feature_cols]).astype(np.float32))
         raw_scores = model.decision_function(X_scaled)
         
@@ -204,7 +213,7 @@ def detect():
         timeline_data.sort(key=lambda x: x['date'])
 
         # Final Clean
-        df_export = df.drop(columns=['timestamp_dt'], errors='ignore')
+        df_export = df.drop(columns=['timestamp_dt', 'user_id_num'], errors='ignore')
         df_export.rename(columns={
             'user_id': 'User ID', 'anomaly_label': 'Status', 'anomaly_score': 'Risk Score',
             'timestamp': 'Time', 'operation': 'Action', 'file_size': 'Size', 
