@@ -229,25 +229,53 @@ def detect():
         ]
 
         # ==========================
-        # BENCHMARKING (SAFE)
+        # BENCHMARKING (SAFE, FULL-FEATURE)
         # ==========================
         benchmarks = []
+
+        # Take a random subset for benchmarking
         subset = min(len(df), MAX_BENCH_ROWS)
         idx = np.random.choice(len(df), subset, replace=False)
 
-        y = (df["anomaly_label"].iloc[idx] == "Anomaly").astype(int)
-        Xb = X[idx]
+        df_sample = df.iloc[idx].copy()
+        Xb = X[idx]  # All features included
+        y = (df_sample["anomaly_label"] == "Anomaly").astype(int)
 
-        if len(np.unique(y)) > 1:
+        # Check if we have enough samples per class
+        counts = np.bincount(y)
+
+        if len(np.unique(y)) > 1 and counts.min() >= 2:
+            # Safe to split with stratify
             Xtr, Xte, ytr, yte = train_test_split(
                 Xb, y, test_size=0.3, stratify=y, random_state=42
             )
+        else:
+            # Small dataset / too few anomalies → oversample minority class just for benchmark
+            anomalies = df_sample[df_sample["anomaly_label"] == "Anomaly"]
+            normal = df_sample[df_sample["anomaly_label"] == "Normal"]
 
+            # Ensure at least 2 anomalies
+            if len(anomalies) == 1:
+                anomalies = pd.concat([anomalies, anomalies], ignore_index=True)
+            elif len(anomalies) == 0:
+                # Edge case: no anomalies in sample, skip benchmark
+                print("⚠️ Skipping benchmark: no anomalies present")
+                Xtr, Xte, ytr, yte = None, None, None, None
+
+            df_sample = pd.concat([normal, anomalies], ignore_index=True)
+            if Xtr is None:
+                Xb = scaler.transform(df_sample[feature_cols])
+                y = (df_sample["anomaly_label"] == "Anomaly").astype(int)
+                Xtr, Xte, ytr, yte = train_test_split(
+                    Xb, y, test_size=0.3, random_state=42
+                )
+
+        # Only run benchmark if we have a valid split
+        if Xtr is not None:
+            # Random Forest Benchmark
             rf_best, best_f1 = None, 0
             for n in (50, 100, 150):
-                rf = RandomForestClassifier(
-                    n_estimators=n, random_state=42, class_weight="balanced"
-                )
+                rf = RandomForestClassifier(n_estimators=n, random_state=42, class_weight="balanced")
                 rf.fit(Xtr, ytr)
                 _, _, f1, _ = precision_recall_fscore_support(
                     yte, rf.predict(Xte), average="binary", zero_division=0
@@ -267,6 +295,7 @@ def detect():
                 }
             )
 
+            # Logistic Regression Benchmark
             lr = LogisticRegression(max_iter=200, solver="liblinear", class_weight="balanced")
             lr.fit(Xtr, ytr)
             p, r, f1, _ = precision_recall_fscore_support(
