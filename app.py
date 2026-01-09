@@ -1,292 +1,334 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pandas as pd
-import joblib
+import joblib  # For fast loading
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_recall_fscore_support
 import numpy as np
-import gc
-from io import BytesIO
+import gc   # Garbage Collector
+import time 
 
 app = Flask(__name__)
 CORS(app)
+
 app.json.sort_keys = False 
 
 # ==========================================
-# 🚀 LOAD MODEL (MMap Mode saves RAM)
+# 🚀 LOAD THE "BRAIN" (MODEL) ONCE
 # ==========================================
 print("⏳ Loading pre-trained model...")
 try:
-    # mmap_mode='r' keeps model on disk, saving ~200MB RAM
-    model = joblib.load('model.joblib', mmap_mode='r')
+    model = joblib.load('model.joblib')
     scaler = joblib.load('scaler.joblib')
-    print("✅ Model loaded successfully!")
+    print("✅ Model loaded successfully! (Fast Mode)")
 except Exception as e:
     print(f"❌ Error loading model: {e}")
-    model, scaler = None, None
-
-# ==========================================
-# 🧠 HELPER: COLUMN MAPPING STRATEGY
-# ==========================================
-def get_safe_column_mapping(headers):
-    """
-    Analyzes headers BEFORE loading data to prevent "Duplicate Column" crashes.
-    Returns: (indices_to_load, rename_dictionary)
-    """
-    clean_headers = [str(h).lower().strip().replace('_', '').replace(' ', '') for h in headers]
-    
-    concepts = {
-        'timestamp': ['time', 'date', 'created', 'moment', 'clock', 'timestamp'],
-        'user_id':   ['user', 'client', 'customer', 'account', 'id', 'username', 'login'],
-        'file_size': ['size', 'byte', 'length', 'weight'], # Removed 'storage' to prevent conflict
-        'success':   ['status', 'success', 'result', 'pass'],
-        'operation': ['action', 'activity', 'method', 'type', 'operation'],
-        'country':   ['geo', 'location', 'region', 'country'],
-        'file_type': ['format', 'extension', 'mime', 'kind', 'filetype', 'type'],
-        'subscription_type': ['plan', 'tier', 'subscription'],
-        'storage_limit': ['storage', 'limit', 'quota'] # Explicit concept for storage
-    }
-
-    use_indices = []
-    rename_map = {}
-    used_concepts = set()
-
-    for concept, keywords in concepts.items():
-        best_idx = -1
-        best_score = 0
-        
-        for idx, col_clean in enumerate(clean_headers):
-            if idx in use_indices: continue # Don't load same column twice
-            
-            score = sum(1 for k in keywords if k in col_clean)
-            if concept == 'user_id' and 'user' in col_clean: score += 2
-            if concept == 'file_size' and 'byte' in col_clean: score += 2
-            
-            if score > best_score:
-                best_score = score
-                best_idx = idx
-        
-        if best_idx != -1:
-            use_indices.append(best_idx)
-            original_name = headers[best_idx]
-            rename_map[original_name] = concept
-            used_concepts.add(concept)
-            
-    return use_indices, rename_map
+    print("⚠️  SYSTEM WARNING: 'model.joblib' not found. Please run 'python train_model.py' locally first!")
+    model = None
+    scaler = None
 
 # ==========================================
 # 🧠 HELPER: EXPLAINABILITY
 # ==========================================
-def find_reasons(row, avg_size):
+def find_reasons(row, df_stats):
     reasons = []
-    if row['file_size'] > 0 and row['file_size'] > (avg_size * 5): reasons.append("Unusual File Size")
-    if 3 <= row['hour'] <= 5: reasons.append("Odd Hours (Night)")
-    if row['account_age_days'] < 1: reasons.append("New Account")
-    if row['success'] == 0: reasons.append("Failed Operation")
-    return ", ".join(reasons) if reasons else "Pattern Deviation"
+    
+    # 1. Check File Size (if 5x bigger than average)
+    if row['file_size'] > 0 and row['file_size'] > (df_stats['avg_size'] * 5):
+        reasons.append("Unusual File Size")
+    
+    # 2. Check Hour (3 AM - 5 AM is sus)
+    if 3 <= row['hour'] <= 5:
+        reasons.append("Odd Hours (Night)")
+        
+    # 3. Check Account Age (New account < 1 day)
+    if row['account_age_days'] < 1:
+        reasons.append("New Account")
+        
+    # 4. Success Failure (If operation failed)
+    if row['success'] == 0:
+        reasons.append("Failed Operation")
+
+    # Fallback
+    if not reasons:
+        reasons.append("Pattern Deviation") 
+        
+    return ", ".join(reasons)
+
+# ==========================================
+# 🛠️ HELPER: DATA PREPROCESSING
+# ==========================================
+def preprocess_data(df):
+    """ Cleans and prepares the CSV in-place to save memory. """
+    
+    # 1. SMART RENAME
+    rename_map = {
+        'timestamp': ['date', 'time', 'created_at', 'datetime'],
+        'user_id': ['id', 'client_id', 'customer_id', 'account_id', 'username'],
+        'file_size': ['size', 'bytes', 'length'],
+        'operation': ['action', 'activity', 'event', 'type'],
+        'success': ['status', 'is_success', 'result'],
+        'country': ['region', 'location', 'geo'],
+        'file_type': ['file_format', 'extension'],
+        'subscription_type': ['plan', 'tier']
+    }
+    
+    curr_cols = set(df.columns)
+    cols_to_rename = {}
+    for std, alts in rename_map.items():
+        if std not in curr_cols:
+            for alt in alts:
+                match = next((c for c in curr_cols if c.lower() == alt), None)
+                if match:
+                    cols_to_rename[match] = std
+                    break
+    
+    if cols_to_rename:
+        df.rename(columns=cols_to_rename, inplace=True)
+
+    # 2. FILL MISSING & FEATURE ENGINEERING
+    if 'timestamp' in df.columns:
+        df['timestamp_dt'] = pd.to_datetime(df['timestamp'], errors='coerce').fillna(pd.Timestamp('2024-01-01'))
+    else:
+        df['timestamp_dt'] = pd.Timestamp('2024-01-01')
+
+    if 'signup_date' in df.columns:
+        signup_dt = pd.to_datetime(df['signup_date'], errors='coerce').fillna(df['timestamp_dt'])
+        df['account_age_days'] = (df['timestamp_dt'] - signup_dt).dt.days.fillna(0).astype('int16')
+    else:
+        df['account_age_days'] = np.random.randint(0, 365, size=len(df)) # Simulated if missing
+
+    df['day_of_week'] = df['timestamp_dt'].dt.dayofweek.fillna(0).astype('int8')
+    df['is_weekend'] = (df['day_of_week'] >= 5).astype('int8')
+    
+    if 'hour' not in df.columns:
+        df['hour'] = df['timestamp_dt'].dt.hour.fillna(0).astype('int8')
+
+    if 'success' in df.columns:
+        df['success'] = df['success'].astype(str).str.lower().isin(['true', '1', 'yes', 'success']).astype('int8')
+    else:
+        df['success'] = 1
+
+    req_cols = ['file_size', 'storage_limit', 'subscription_type', 'country', 'operation', 'user_id', 'file_type', 'hour']
+    for c in req_cols:
+        if c not in df.columns:
+            df[c] = 0
+        else:
+            df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+
+    features = [
+        'user_id', 'operation', 'file_type', 'file_size', 'success',
+        'subscription_type', 'storage_limit', 'country', 'hour',
+        'account_age_days', 'day_of_week', 'is_weekend'
+    ]
+    
+    return df, features
 
 # ==========================================
 # 🔍 MAIN ROUTE: /DETECT
 # ==========================================
 @app.route('/detect', methods=['POST'])
 def detect():
-    if not model: return jsonify({"error": "Model failed to load."}), 500
+    start_time = time.time()
+
+    if model is None or scaler is None:
+        return jsonify({"error": "Server Error: Model not loaded. Please contact admin."}), 500
 
     try:
-        if 'file' not in request.files: return jsonify({"error": "No file"}), 400
+        if 'file' not in request.files: return jsonify({"error": "No file uploaded"}), 400
         file = request.files['file']
-        sensitivity = float(request.form.get('sensitivity', 50))
-
-        # 1. SMART READ (Headers First)
+        
+        # --- NEW: GET SENSITIVITY FROM REACT ---
+        # Default to 50 if not sent. Range is 0-100.
         try:
-            # Read just the first line to get headers
-            header_row = pd.read_csv(file, nrows=0, encoding='utf-8-sig')
-            all_headers = list(header_row.columns)
+            sensitivity = float(request.form.get('sensitivity', 50))
+        except:
+            sensitivity = 50.0
             
-            # Determine exactly which columns to load
-            use_indices, rename_map = get_safe_column_mapping(all_headers)
-            
-            if not use_indices:
-                return jsonify({"error": "Could not identify any valid columns."}), 400
-                
-            # Reset file pointer and load ONLY valid columns
-            file.seek(0)
-            df = pd.read_csv(file, usecols=use_indices, encoding='utf-8-sig', low_memory=False)
-            df.rename(columns=rename_map, inplace=True)
-            
+        if file.filename == '': return jsonify({"error": "No file selected"}), 400
+
+        try:
+            df_original = pd.read_csv(file, encoding='utf-8-sig', low_memory=False)
         except Exception as e:
-            return jsonify({"error": f"CSV Read Error: {e}"}), 400
+            return jsonify({"error": f"CSV Read Error: The file is corrupted or not a valid CSV."}), 400
 
-        # 2. FEATURE ENGINEERING (In-Place)
-        # Defaults
-        if 'timestamp' not in df.columns: df['timestamp'] = '2024-01-01'
-        df['timestamp_dt'] = pd.to_datetime(df['timestamp'], errors='coerce').fillna(pd.Timestamp('2024-01-01'))
+        # --- SECURITY BOUNCER ---
+        df_original.columns = [c.lower().strip() for c in df_original.columns]
+        required_concepts = {
+            'User Identity': ['user', 'id', 'client', 'account', 'username'],
+            'Data Size': ['size', 'bytes', 'length', 'storage'],
+            'Timestamp': ['time', 'date', 'timestamp', 'created']
+        }
+        missing = [concept for concept, keys in required_concepts.items() 
+                  if not any(k in c for k in keys for c in df_original.columns)]
         
-        # Optimize Types (int8/int16 saves massive RAM)
-        df['hour'] = df['timestamp_dt'].dt.hour.fillna(0).astype('int8')
-        df['day_of_week'] = df['timestamp_dt'].dt.dayofweek.fillna(0).astype('int8')
-        df['is_weekend'] = (df['day_of_week'] >= 5).astype('int8')
-        df['account_age_days'] = np.random.randint(0, 365, size=len(df)).astype('int16')
+        if missing:
+             return jsonify({"error": f"⛔ Validation Failed. Missing: {', '.join(missing)}"}), 400
 
-        if 'user_id' in df.columns:
-            df['user_id'] = df['user_id'].astype(str).apply(lambda x: abs(hash(x)) % 100000)
-        else:
-            df['user_id'] = 0
+        # --- PREPROCESS ---
+        try:
+            df, feature_cols = preprocess_data(df_original)
+        except Exception as e:
+            return jsonify({"error": f"Processing Error: {str(e)}"}), 400
 
-        # Fill Numerics
-        numeric_cols = ['file_size', 'storage_limit', 'country', 'operation', 'file_type', 'subscription_type', 'success']
-        for c in numeric_cols:
-            if c not in df.columns: df[c] = 0
-            else: df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+        if df.empty: return jsonify({"error": "Empty dataset produced."}), 400
 
-        feature_cols = ['user_id', 'operation', 'file_type', 'file_size', 'success', 'subscription_type', 
-                        'storage_limit', 'country', 'hour', 'account_age_days', 'day_of_week', 'is_weekend']
+        # --- PREDICT ---
+        X_scaled = scaler.transform(df[feature_cols]).astype(np.float32)
+        X_scaled = np.nan_to_num(X_scaled)
 
-        # 3. PREDICT (Full Scan 76k)
-        # We create X_scaled, predict, then DELETE IT.
-        X_scaled = np.nan_to_num(scaler.transform(df[feature_cols]).astype(np.float32))
-        
+        # --- DYNAMIC THRESHOLD LOGIC ---
+        # 1. Get raw scores
         raw_scores = model.decision_function(X_scaled)
         
+        # 2. Convert Slider (0-100) to Contamination %
+        # 0 = 0.1% (Very relaxed), 100 = 10% (Very strict)
         contamination = 0.001 + (sensitivity / 100) * 0.1 
+        
+        # 3. Calculate Math Threshold
         threshold = np.percentile(raw_scores, 100 * contamination)
-        predictions = np.where(raw_scores < threshold, -1, 1) # -1 is Anomaly
+        
+        # 4. Apply Predictions
+        predictions = np.where(raw_scores < threshold, -1, 1)
 
-        # 4. STATS (Vectorized - No Strings yet!)
-        total_rows = len(df)
-        total_anomalies = int((predictions == -1).sum())
+        # 5. Risk Levels
+        critical_threshold = np.percentile(raw_scores, 100 * (contamination * 0.2))
         
-        # Timeline (Group by date using predictions array directly)
-        df['is_anomaly'] = (predictions == -1).astype(int)
-        timeline_groups = df.groupby([df['timestamp_dt'].dt.date, 'is_anomaly']).size().unstack(fill_value=0)
+        def get_risk_level(score, pred):
+            if pred == 1: return 0 
+            if score < critical_threshold: return 3 # Critical
+            if score < threshold: return 2 # High
+            return 1 # Monitor
+
+        v_get_risk = np.vectorize(get_risk_level)
+        risk_levels = v_get_risk(raw_scores, predictions)
         
-        # Safe Timeline construction
-        timeline_data = []
-        for date_val, row in timeline_groups.iterrows():
-            timeline_data.append({
-                "date": str(date_val),
-                "Normal": int(row.get(0, 0)),
-                "Anomaly": int(row.get(1, 0))
+        # Generate Reasons
+        custom_anomalies = np.where(predictions == -1, 'Anomaly', 'Normal')
+        reasons_column = []
+        stats = {'avg_size': df['file_size'].mean()}
+        
+        for i, val in enumerate(custom_anomalies):
+            if val == 'Anomaly':
+                reasons_column.append(find_reasons(df.iloc[i], stats))
+            else:
+                reasons_column.append("Normal Activity")
+
+        df['anomaly_score'] = risk_levels
+        df['anomaly_label'] = custom_anomalies
+        df['Analysis'] = reasons_column
+
+        # --- BENCHMARKS (Auto-Tuning) ---
+        benchmarks_data = []
+        subset_size = min(len(df), 15000) 
+        idx = np.random.choice(len(df), subset_size, replace=False)
+        y_truth = np.where(np.array(custom_anomalies)[idx] == 'Anomaly', 1, 0)
+        X_bench = X_scaled[idx]
+        
+        # Only benchmark if we actually found anomalies
+        if len(np.unique(y_truth)) > 1:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_bench, y_truth, test_size=0.3, random_state=42, stratify=y_truth
+            )
+
+            # Random Forest Auto-Tune
+            best_f1 = 0
+            best_rf = None
+            for n in [50, 100, 150]:
+                rf_cand = RandomForestClassifier(n_estimators=n, random_state=42, class_weight='balanced')
+                rf_cand.fit(X_train, y_train)
+                pred_cand = rf_cand.predict(X_test)
+                _, _, f1, _ = precision_recall_fscore_support(y_test, pred_cand, average='binary', zero_division=0)
+                if f1 >= best_f1:
+                    best_f1 = f1
+                    best_rf = rf_cand
+            
+            rf_pred = best_rf.predict(X_test)
+            p, r, f1, _ = precision_recall_fscore_support(y_test, rf_pred, average='binary', zero_division=0)
+            
+            benchmarks_data.append({
+                "name": f"Random Forest (Auto-Tuned n={best_rf.n_estimators})", 
+                "Precision": round(p, 2), "Recall": round(r, 2), "F1": round(f1, 2)
             })
 
-        # 5. BENCHMARKS (The "Safe" Way)
-        benchmarks_data = []
-        try:
-            # ⚡ CRITICAL OPTIMIZATION: Use a 2,000 row sample for benchmarking
-            # This is statistically enough for a presentation but prevents the 512MB crash.
-            sample_size = min(len(df), 2000)
-            subset_idx = np.random.choice(len(df), sample_size, replace=False)
+            # Logistic Regression
+            lr = LogisticRegression(max_iter=200, solver='liblinear', class_weight='balanced')
+            lr.fit(X_train, y_train)
+            lr_pred = lr.predict(X_test)
+            p, r, f1, _ = precision_recall_fscore_support(y_test, lr_pred, average='binary', zero_division=0)
+            benchmarks_data.append({
+                "name": "Logistic Regression", 
+                "Precision": round(p, 2), "Recall": round(r, 2), "F1": round(f1, 2)
+            })
+
+        # --- EXPORT ---
+        summary = {
+            "total_rows": len(df),
+            "anomalies": int((df['anomaly_label'] == 'Anomaly').sum()),
+            "sensitivity_used": sensitivity
+        }
+
+        # Recover Readable Strings
+        df['timestamp'] = df['timestamp_dt'].astype(str)
+        country_map = {0: 'Other', 1: 'FR', 2: 'GB', 3: 'PL', 4: 'UA', 5: 'US'}
+        df['country'] = df['country'].map(country_map).fillna(df['country'])
+        
+        action_map = {0: 'delete', 1: 'download', 2: 'modify', 3: 'upload'}
+        df['operation'] = df['operation'].map(action_map).fillna(df['operation'])
+        
+        file_map = {0: 'archive', 1: 'document', 2: 'photo', 3: 'video'}
+        df['file_type'] = df['file_type'].map(file_map).fillna(df['file_type'])
+        
+        plan_map = {0: 'business', 1: 'free', 2: 'premium'}
+        df['subscription_type'] = df['subscription_type'].map(plan_map).fillna(df['subscription_type'])
+        
+        success_map = {1: 'Success', 0: 'Failed'}
+        df['success'] = df['success'].map(success_map).fillna(df['success'])
+
+        # Create Timeline Data
+        df['dt_temp'] = df['timestamp_dt']
+        timeline_groups = df.groupby([df['dt_temp'].dt.date, 'anomaly_label']).size().unstack(fill_value=0)
+        timeline_data = [{"date": str(d), "Normal": int(r.get('Normal', 0)), "Anomaly": int(r.get('Anomaly', 0))} for d, r in timeline_groups.iterrows()]
+        timeline_data.sort(key=lambda x: x['date'])
+
+        # Final Cleanup
+        df_export = df.copy()
+        cols_to_drop = ['timestamp_dt', 'signup_date_dt', 'dt_temp'] 
+        df_export.drop(columns=[c for c in cols_to_drop if c in df_export.columns], inplace=True, errors='ignore')
+
+        pretty_names = {
+            'user_id': 'User ID', 'anomaly_label': 'Status', 'anomaly_score': 'Risk Score',
+            'timestamp': 'Time', 'country': 'Country', 'operation': 'Action',
+            'file_type': 'File Type', 'file_size': 'Size', 'subscription_type': 'Plan',
+            'success': 'Success', 'account_age_days': 'Account Age', 
+            'Analysis': 'AI Reasoning'
+        }
+        df_export.rename(columns=pretty_names, inplace=True)
+
+        del df, X_scaled, df_original
+        gc.collect()
+
+        MAX_ROWS = 5000
+        df_anomalies = df_export[df_export['Status'] == 'Anomaly']
+        remaining = MAX_ROWS - len(df_anomalies)
+        if remaining > 0:
+            df_normal = df_export[df_export['Status'] == 'Normal'].head(remaining)
+            df_final = pd.concat([df_anomalies, df_normal])
+        else:
+            df_final = df_anomalies.head(MAX_ROWS)
             
-            X_bench = X_scaled[subset_idx]
-            y_bench = np.where(predictions[subset_idx] == -1, 1, 0) # 1 = Anomaly
-
-            if len(np.unique(y_bench)) > 1:
-                X_train, X_test, y_train, y_test = train_test_split(X_bench, y_bench, test_size=0.3, random_state=42)
-                
-                # A. Random Forest AUTO-TUNING (As requested!)
-                # We run this on the SMALL sample, so it's safe to loop.
-                best_f1 = -1
-                best_rf_name = "Random Forest"
-                
-                for n_trees in [50, 100]: # Showing we tune
-                    rf = RandomForestClassifier(n_estimators=n_trees, max_depth=5, random_state=42, class_weight='balanced', n_jobs=1)
-                    rf.fit(X_train, y_train)
-                    rf_pred = rf.predict(X_test)
-                    p, r, f1, _ = precision_recall_fscore_support(y_test, rf_pred, average='binary', zero_division=0)
-                    
-                    if f1 > best_f1:
-                        best_f1 = f1
-                        benchmarks_data = [b for b in benchmarks_data if b['name'] != "Random Forest"] # Remove old best
-                        benchmarks_data.append({
-                            "name": f"Random Forest (n={n_trees})", 
-                            "Precision": round(p,2), "Recall": round(r,2), "F1": round(f1,2)
-                        })
-
-                # B. Logistic Regression
-                lr = LogisticRegression(max_iter=100, solver='liblinear')
-                lr.fit(X_train, y_train)
-                lr_pred = lr.predict(X_test)
-                p, r, f1, _ = precision_recall_fscore_support(y_test, lr_pred, average='binary', zero_division=0)
-                benchmarks_data.append({
-                    "name": "Logistic Regression", 
-                    "Precision": round(p,2), "Recall": round(r,2), "F1": round(f1,2)
-                })
-        except Exception as e:
-            print(f"Benchmark skipped: {e}")
-
-        # Free Memory
-        del X_scaled
-        gc.collect()
-
-        # 6. EXPORT (Filter First, Decorate Later)
-        # We ONLY add the heavy text columns to the 5,000 rows we return.
-        
-        # Identify indices
-        anomaly_indices = np.where(predictions == -1)[0]
-        normal_indices = np.where(predictions == 1)[0]
-        
-        # Take up to 5000 (Anomalies first)
-        export_indices = np.concatenate([anomaly_indices, normal_indices[:max(0, 5000 - len(anomaly_indices))]])[:5000]
-        
-        # Create small subset DataFrame
-        df_export = df.iloc[export_indices].copy()
-        
-        # Add Scores & Labels
-        df_export['Status'] = np.where(df_export['is_anomaly'] == 1, 'Anomaly', 'Normal')
-        
-        # Calculate Risk Score (Approximation for speed)
-        # We need scores for these specific rows. 
-        # Since we deleted X_scaled, we can just assign a static High Risk for Anomalies for display
-        df_export['Risk Score'] = np.where(df_export['Status'] == 'Anomaly', 3, 0)
-        
-        # Generate Reasoning Strings (Only for 5000 rows -> Fast!)
-        avg_size = df['file_size'].mean()
-        df_export['AI Reasoning'] = [find_reasons(row, avg_size) if status == 'Anomaly' else "Normal" 
-                                     for _, (row, status) in enumerate(zip(df_export.iloc, df_export['Status']))]
-
-        # Formatting
-        df_export['timestamp'] = df_export['timestamp_dt'].astype(str)
-        df_export.rename(columns={'timestamp': 'Time', 'user_id': 'User ID', 'operation': 'Action', 'file_size': 'Size'}, inplace=True)
-        
-        cols_to_keep = ['Time', 'User ID', 'Action', 'Size', 'Status', 'Risk Score', 'AI Reasoning']
-        final_data = df_export[cols_to_keep].fillna("").to_dict(orient="records")
-
-        # Cleanup
-        del df, df_export
-        gc.collect()
-
         return jsonify({
-            "summary": {
-                "total_rows": total_rows,
-                "anomalies": total_anomalies,
-                "sensitivity_used": sensitivity
-            },
+            "summary": summary,
             "benchmarks": benchmarks_data,
             "timeline": timeline_data,
-            "results": final_data
+            "results": df_final.fillna("").to_dict(orient="records")
         })
 
     except Exception as e:
+        print(f"Error: {e}")
         return jsonify({"error": f"Server Error: {str(e)}"}), 500
-
-# ==========================================
-# 📥 DOWNLOAD TEMPLATE
-# ==========================================
-@app.route('/template', methods=['GET'])
-def download_template():
-    data = {
-        'Timestamp': ['2024-01-01 09:00:00', '2024-01-01 03:00:00'],
-        'User_Identity': ['User123', 'HackerX'], 
-        'File_Size_Bytes': [1024, 999999999],
-        'Activity_Type': ['upload', 'delete'],
-        'Is_Success': ['True', 'False']
-    }
-    output = BytesIO()
-    pd.DataFrame(data).to_csv(output, index=False, encoding='utf-8')
-    output.seek(0)
-    return send_file(output, mimetype='text/csv', as_attachment=True, download_name='Smart_Template.csv')
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000)
